@@ -40,17 +40,21 @@ struct AudioCaptureSettings {
   int channels;
   int opus_bitrate;
   int frame_duration_ms;
+  bool use_vbr;
+  bool use_silence_gate;
 
   /**
    * @brief Default constructor for AudioCaptureSettings.
-   * Initializes settings with common default values (48kHz, stereo, 128kbps).
+   * Initializes settings with common default values (48kHz, stereo, 128kbps, VBR, Silence Gate on).
    */
   AudioCaptureSettings()
     : device_name(nullptr),
       sample_rate(48000),
       channels(2),
       opus_bitrate(128000),
-      frame_duration_ms(20) {}
+      frame_duration_ms(20),
+      use_vbr(true),
+      use_silence_gate(true) {}
 
   /**
    * @brief Parameterized constructor for AudioCaptureSettings.
@@ -60,13 +64,17 @@ struct AudioCaptureSettings {
    * @param ch The number of channels (1 for mono, 2 for stereo).
    * @param br The target bitrate for the Opus encoder in bits per second.
    * @param dur The duration of each audio frame in milliseconds (e.g., 20, 40, 60).
+   * @param vbr Flag to enable Variable Bitrate (true) or Constant Bitrate (false).
+   * @param gate Flag to enable the silence detection gate (true) or disable it (false).
    */
-  AudioCaptureSettings(const char* dev, uint32_t sr, int ch, int br, int dur)
+  AudioCaptureSettings(const char* dev, uint32_t sr, int ch, int br, int dur, bool vbr, bool gate)
     : device_name(dev),
       sample_rate(sr),
       channels(ch),
       opus_bitrate(br),
-      frame_duration_ms(dur) {}
+      frame_duration_ms(dur),
+      use_vbr(vbr),
+      use_silence_gate(gate) {}
 };
 
 /**
@@ -215,7 +223,7 @@ private:
    * - Connecting to the PulseAudio server and the specified source device.
    * - Initializing the Opus encoder with the configured settings.
    * - Continuously reading raw PCM audio chunks from PulseAudio.
-   * - Detecting and skipping silent chunks to save encoding work.
+   * - Detecting and skipping silent chunks to save encoding work (if enabled).
    * - Encoding non-silent audio chunks into the Opus format.
    * - Invoking the user-provided callback with the encoded data.
    * - Periodically logging capture and encoding statistics.
@@ -266,7 +274,7 @@ private:
     std::cout << "[pcmflux] SUCCESS: Opus encoder created." << std::endl;
 
     opus_encoder_ctl(encoder, OPUS_SET_BITRATE(local_settings.opus_bitrate));
-    opus_encoder_ctl(encoder, OPUS_SET_VBR(0)); // Use Constant Bitrate (CBR)
+    opus_encoder_ctl(encoder, OPUS_SET_VBR(local_settings.use_vbr ? 1 : 0));
 
     const int frame_size_per_channel =
         (local_settings.sample_rate * local_settings.frame_duration_ms) / 1000;
@@ -282,6 +290,8 @@ private:
               << ", Rate: " << local_settings.sample_rate
               << ", Channels: " << local_settings.channels
               << ", Bitrate: " << local_settings.opus_bitrate / 1000 << " kbps"
+              << ", VBR: " << (local_settings.use_vbr ? "On" : "Off (CBR)")
+              << ", Silence Gate: " << (local_settings.use_silence_gate ? "On" : "Off")
               << ", PCM Chunk: " << pcm_chunk_size_bytes << " bytes"
               << std::endl;
 
@@ -301,12 +311,16 @@ private:
       }
       chunks_read++;
 
-      bool is_silent = true;
-      for (int16_t sample : pcm_buffer) {
-        if (sample != 0) {
-          is_silent = false;
-          break;
+      bool is_silent = false;
+      if (local_settings.use_silence_gate) {
+        bool all_zeros = true;
+        for (int16_t sample : pcm_buffer) {
+          if (sample != 0) {
+            all_zeros = false;
+            break;
+          }
         }
+        is_silent = all_zeros;
       }
 
       if (is_silent) {

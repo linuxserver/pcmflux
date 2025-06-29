@@ -28,5 +28,5 @@ The `example` directory contains a standalone demo that captures system audio, b
 To run the example:
 
 1.  Install the module: `pip3 install .`
-2.  Run the server: `python3 example/audio_to_browser.py`
+2.  Run the server: `cd example && python3 audio_to_browser.py`
 3.  Open `http://localhost:9001` in a modern web browser (Chrome, Edge, etc.).
