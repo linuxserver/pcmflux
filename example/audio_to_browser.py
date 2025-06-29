@@ -184,8 +184,8 @@ async def main_async():
     # the name of your output's ".monitor" source. Use `pactl list sources`
     # in a terminal to find available source names.
     # To use the system's default microphone, set device_name to None or b''.
-    #g_settings.device_name = b"alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor"
-    g_settings.device_name = None
+    g_settings.device_name = b"alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor"
+    #g_settings.device_name = None
     g_settings.sample_rate = 48000
     g_settings.channels = 2
     g_settings.opus_bitrate = 128000
