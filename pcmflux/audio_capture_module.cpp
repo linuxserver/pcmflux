@@ -43,6 +43,7 @@ struct AudioCaptureSettings {
   bool use_vbr;
   bool use_silence_gate;
   bool debug_logging;
+  int latency_ms;
 
   /**
    * @brief Default constructor for AudioCaptureSettings.
@@ -56,7 +57,8 @@ struct AudioCaptureSettings {
       frame_duration_ms(20),
       use_vbr(true),
       use_silence_gate(true),
-      debug_logging(false) {}
+      debug_logging(false),
+      latency_ms(0) {}
 
   /**
    * @brief Parameterized constructor for AudioCaptureSettings.
@@ -69,7 +71,7 @@ struct AudioCaptureSettings {
    * @param vbr Flag to enable Variable Bitrate (true) or Constant Bitrate (false).
    * @param gate Flag to enable the silence detection gate (true) or disable it (false).
    */
-  AudioCaptureSettings(const char* dev, uint32_t sr, int ch, int br, int dur, bool vbr, bool gate, bool debug_logging)
+  AudioCaptureSettings(const char* dev, uint32_t sr, int ch, int br, int dur, bool vbr, bool gate, bool debug_logging, int lat)
     : device_name(dev),
       sample_rate(sr),
       channels(ch),
@@ -77,7 +79,8 @@ struct AudioCaptureSettings {
       frame_duration_ms(dur),
       use_vbr(vbr),
       use_silence_gate(gate),
-      debug_logging(debug_logging) {}
+      debug_logging(debug_logging),
+      latency_ms(lat) {}
 };
 
 /**
@@ -245,16 +248,32 @@ private:
     const pa_sample_spec ss = {.format = PA_SAMPLE_S16LE,
                                .rate = local_settings.sample_rate,
                                .channels = (uint8_t)local_settings.channels};
+
+    pa_buffer_attr attr;
+    attr.maxlength = (uint32_t)-1;
+    attr.tlength = (uint32_t)-1;
+    attr.prebuf = (uint32_t)-1;
+    attr.minreq = (uint32_t)-1;
+    attr.fragsize  = (uint32_t)-1;
+    if (local_settings.latency_ms > 0) {
+        attr.fragsize = pa_usec_to_bytes(local_settings.latency_ms * 1000, &ss);
+    } 
+
     const char* device_to_use = local_settings.device_name;
     if (device_to_use && std::strlen(device_to_use) == 0) {
       device_to_use = nullptr;
     }
 
     std::cout << "[pcmflux] Attempting to connect to PulseAudio device: "
-              << (device_to_use ? device_to_use : "system_default") << "..."
-              << std::endl;
+              << (device_to_use ? device_to_use : "system_default");
+    if (local_settings.latency_ms > 0) {
+        std::cout << " with latency: " << local_settings.latency_ms << "ms" << std::endl;
+    } else {
+        std::cout << " (default latency)" << std::endl;
+    }
+
     s = pa_simple_new(NULL, "pcmflux", PA_STREAM_RECORD, device_to_use,
-                      "Audio Capture", &ss, NULL, NULL, &pa_error);
+                      "Audio Capture", &ss, NULL, &attr, &pa_error);
 
     if (!s) {
       std::cerr << "[pcmflux] ERROR: pa_simple_new() failed: "

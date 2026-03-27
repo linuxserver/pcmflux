@@ -17,6 +17,7 @@ class AudioCaptureSettings(ctypes.Structure):
         ("use_vbr", ctypes.c_bool),
         ("use_silence_gate", ctypes.c_bool),
         ("debug_logging", ctypes.c_bool),
+        ("latency_ms", ctypes.c_int)
     ]
 
 class AudioChunkEncodeResult(ctypes.Structure):
