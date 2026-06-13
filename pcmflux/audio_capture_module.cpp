@@ -44,6 +44,13 @@ struct AudioCaptureSettings {
   bool use_silence_gate;
   bool debug_logging;
   int latency_ms;
+  // Append-only fields (keep ABI offsets above stable). Mirror pixelflux.
+  // false (default) = C++ prepends the 2-byte header [0x01,0x00] (WebSocket);
+  // true = raw Opus, no header (WebRTC).
+  bool omit_audio_header;
+  // false (default) = C++ callback frees result.data; true = ownership handed to
+  // Python (zero-copy OwnedAudioFrame) and the callback must NOT free it.
+  bool deferred_free;
 
   /**
    * @brief Default constructor for AudioCaptureSettings.
@@ -58,7 +65,9 @@ struct AudioCaptureSettings {
       use_vbr(true),
       use_silence_gate(true),
       debug_logging(false),
-      latency_ms(0) {}
+      latency_ms(0),
+      omit_audio_header(false),
+      deferred_free(false) {}
 
   /**
    * @brief Parameterized constructor for AudioCaptureSettings.
@@ -70,8 +79,11 @@ struct AudioCaptureSettings {
    * @param dur The duration of each audio frame in milliseconds (e.g., 20, 40, 60).
    * @param vbr Flag to enable Variable Bitrate (true) or Constant Bitrate (false).
    * @param gate Flag to enable the silence detection gate (true) or disable it (false).
+   * @param omit_hdr Flag to omit the native 2-byte audio header (true) or emit it (false).
+   * @param deferred Flag to hand buffer ownership to Python (true) or free here (false).
    */
-  AudioCaptureSettings(const char* dev, uint32_t sr, int ch, int br, int dur, bool vbr, bool gate, bool debug_logging, int lat)
+  AudioCaptureSettings(const char* dev, uint32_t sr, int ch, int br, int dur, bool vbr, bool gate, bool debug_logging, int lat,
+                       bool omit_hdr = false, bool deferred = false)
     : device_name(dev),
       sample_rate(sr),
       channels(ch),
@@ -80,7 +92,9 @@ struct AudioCaptureSettings {
       use_vbr(vbr),
       use_silence_gate(gate),
       debug_logging(debug_logging),
-      latency_ms(lat) {}
+      latency_ms(lat),
+      omit_audio_header(omit_hdr),
+      deferred_free(deferred) {}
 };
 
 /**
@@ -105,7 +119,7 @@ struct AudioChunkEncodeResult {
    * @param other The AudioChunkEncodeResult to move from.
    */
   AudioChunkEncodeResult(AudioChunkEncodeResult&& other) noexcept
-    : size(other.size), data(other.data) {
+    : size(other.size), data(other.data), pts(other.pts) {
     other.size = 0;
     other.data = nullptr;
     other.pts = 0;
@@ -129,6 +143,10 @@ struct AudioChunkEncodeResult {
     }
     return *this;
   }
+
+  // Frees the buffer if the consumer didn't. free_audio_chunk_encode_result_data
+  // nulls data first, so this is a no-op on the normal path.
+  ~AudioChunkEncodeResult() { delete[] data; }
 
 private:
   // Disallow copy and copy assignment to prevent double-freeing the data buffer.
@@ -154,6 +172,12 @@ extern "C" {
 void free_audio_chunk_encode_result_data(AudioChunkEncodeResult* result);
 }
 
+// Legal Opus frame durations (ms) that are expressible as an int. opus_encode()
+// only accepts 2.5/5/10/20/40/60 ms of the encoder rate; 2.5 isn't an int.
+static bool is_valid_opus_frame_duration_ms(int ms) {
+  return ms == 5 || ms == 10 || ms == 20 || ms == 40 || ms == 60;
+}
+
 /**
  * @brief Manages the audio capture process from PulseAudio and Opus encoding.
  * This class encapsulates the logic for capturing raw PCM audio, encoding it
@@ -166,8 +190,12 @@ public:
   std::thread capture_thread;
   AudioChunkCallback chunk_callback = nullptr;
   void* user_data = nullptr;
+  std::atomic<bool> started_ok{false};
   mutable std::mutex settings_mutex;
   AudioCaptureSettings current_settings;
+  // Lock-free mirror of !omit_audio_header so the hot path reads it without the
+  // mutex. (deferred_free needs no mirror; it's resolved entirely Python-side.)
+  std::atomic<bool> emit_audio_header_{true};
 
   /**
    * @brief Default constructor for AudioCaptureModule.
@@ -187,10 +215,19 @@ public:
    * If a capture thread is already running, it is stopped first.
    */
   void start_capture() {
+    if (capture_thread.joinable() &&
+        capture_thread.get_id() == std::this_thread::get_id()) {
+      // Re-entrant start from the callback (on the capture thread): can't
+      // join/recreate the running thread, so just keep it running and undo any
+      // stop_requested a nested stop_capture() set.
+      stop_requested = false;
+      return;
+    }
     if (capture_thread.joinable()) {
       stop_capture();
     }
     stop_requested = false;
+    started_ok = false;
     capture_thread = std::thread(&AudioCaptureModule::capture_loop, this);
   }
 
@@ -200,7 +237,10 @@ public:
    */
   void stop_capture() {
     stop_requested = true;
-    if (capture_thread.joinable()) {
+    // Don't join from within the capture thread itself (re-entrant stop from the
+    // callback): join() on the current thread throws. stop_requested suffices.
+    if (capture_thread.joinable() &&
+        capture_thread.get_id() != std::this_thread::get_id()) {
       capture_thread.join();
     }
   }
@@ -214,6 +254,16 @@ public:
   void modify_settings(const AudioCaptureSettings& new_settings) {
     std::lock_guard<std::mutex> lock(settings_mutex);
     current_settings = new_settings;
+    // Publish the header toggle to its lock-free mirror so the capture thread
+    // reads it without taking the mutex each frame.
+    emit_audio_header_.store(!new_settings.omit_audio_header, std::memory_order_relaxed);
+  }
+
+  // Atomically updates only the bitrate (under the mutex), so it can't lose a
+  // concurrent modify_settings() the way a get/modify/set of the whole struct would.
+  void set_bitrate(int new_bitrate) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    current_settings.opus_bitrate = new_bitrate;
   }
 
   /**
@@ -256,8 +306,9 @@ private:
     attr.minreq = (uint32_t)-1;
     attr.fragsize  = (uint32_t)-1;
     if (local_settings.latency_ms > 0) {
-        attr.fragsize = pa_usec_to_bytes(local_settings.latency_ms * 1000, &ss);
-    } 
+        // Cast before multiplying to avoid signed-int overflow (result is pa_usec_t).
+        attr.fragsize = pa_usec_to_bytes((pa_usec_t)local_settings.latency_ms * 1000, &ss);
+    }
 
     const char* device_to_use = local_settings.device_name;
     if (device_to_use && std::strlen(device_to_use) == 0) {
@@ -299,8 +350,24 @@ private:
     }
     std::cout << "[pcmflux] SUCCESS: Opus encoder created." << std::endl;
 
-    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(local_settings.opus_bitrate));
-    opus_encoder_ctl(encoder, OPUS_SET_VBR(local_settings.use_vbr ? 1 : 0));
+    if (opus_encoder_ctl(encoder, OPUS_SET_BITRATE(local_settings.opus_bitrate)) != OPUS_OK) {
+      std::cerr << "[pcmflux] WARNING: failed to apply initial bitrate ("
+                << local_settings.opus_bitrate
+                << "); encoder will use its default." << std::endl;
+    }
+    if (opus_encoder_ctl(encoder, OPUS_SET_VBR(local_settings.use_vbr ? 1 : 0)) != OPUS_OK) {
+      std::cerr << "[pcmflux] WARNING: failed to apply VBR mode." << std::endl;
+    }
+
+    // An illegal duration makes opus_encode() fail on every frame; fail fast.
+    if (!is_valid_opus_frame_duration_ms(local_settings.frame_duration_ms)) {
+      std::cerr << "[pcmflux] ERROR: invalid frame_duration_ms ("
+                << local_settings.frame_duration_ms
+                << "). Must be one of 5, 10, 20, 40, 60." << std::endl;
+      opus_encoder_destroy(encoder);
+      pa_simple_free(s);
+      return;
+    }
 
     const int frame_size_per_channel =
         (local_settings.sample_rate * local_settings.frame_duration_ms) / 1000;
@@ -308,6 +375,7 @@ private:
         frame_size_per_channel * local_settings.channels * sizeof(int16_t);
     std::vector<int16_t> pcm_buffer(frame_size_per_channel *
                                     local_settings.channels);
+    const std::vector<int16_t> silence_ref(pcm_buffer.size(), 0);
     const int max_opus_packet_size = 4000;
     std::vector<unsigned char> opus_buffer(max_opus_packet_size);
 
@@ -330,29 +398,36 @@ private:
     bool first_sound_detected = false;
     uint64_t total_samples_processed = 0;
     int current_applied_bitrate = local_settings.opus_bitrate;
+    int last_requested_bitrate = local_settings.opus_bitrate;
 
+    started_ok = true;
     while (!stop_requested) {
-      {
-        AudioCaptureSettings latest_settings = get_current_settings();
-        // Handle Bitrate Change
-        if (latest_settings.opus_bitrate != current_applied_bitrate) {
-            int ret = opus_encoder_ctl(encoder, OPUS_SET_BITRATE(latest_settings.opus_bitrate));
-            if (ret == OPUS_OK) {
-                std::cout << "[pcmflux] Dynamic Bitrate Update: " 
-                                << (current_applied_bitrate / 1000) << " -> " 
-                                << (latest_settings.opus_bitrate / 1000) << " kbps" 
-                                << std::endl;
-                current_applied_bitrate = latest_settings.opus_bitrate;
-            } else {
-                std::cerr << "[pcmflux] Failed to update bitrate: " << opus_strerror(ret) << std::endl;
-            }
-        }
+      // Structural fields stay frozen in local_settings; only the live flags
+      // (bitrate, silence gate, debug logging) are re-read here.
+      AudioCaptureSettings latest_settings = get_current_settings();
+      // Re-apply only when the requested bitrate changes, so a value opus keeps
+      // rejecting doesn't re-log every frame.
+      if (latest_settings.opus_bitrate != last_requested_bitrate) {
+          last_requested_bitrate = latest_settings.opus_bitrate;
+          int ret = opus_encoder_ctl(encoder, OPUS_SET_BITRATE(latest_settings.opus_bitrate));
+          if (ret == OPUS_OK) {
+              std::cout << "[pcmflux] Dynamic Bitrate Update: "
+                        << (current_applied_bitrate / 1000) << " -> "
+                        << (latest_settings.opus_bitrate / 1000) << " kbps" << std::endl;
+              current_applied_bitrate = latest_settings.opus_bitrate;
+          } else {
+              std::cerr << "[pcmflux] Failed to update bitrate ("
+                        << latest_settings.opus_bitrate << "): " << opus_strerror(ret) << std::endl;
+          }
       }
 
       if (pa_simple_read(s, pcm_buffer.data(), pcm_chunk_size_bytes,
                          &pa_error) < 0) {
         std::cerr << "[pcmflux] ERROR: pa_simple_read() failed: "
                   << pa_strerror(pa_error) << std::endl;
+        // Mark not-running before teardown so is_audio_capture_running() can't
+        // transiently report 1 while the thread is dying after a read error.
+        started_ok = false;
         break;
       }
       chunks_read++;
@@ -361,15 +436,11 @@ private:
       total_samples_processed += frame_size_per_channel;
 
       bool is_silent = false;
-      if (local_settings.use_silence_gate) {
-        bool all_zeros = true;
-        for (int16_t sample : pcm_buffer) {
-          if (sample != 0) {
-            all_zeros = false;
-            break;
-          }
-        }
-        is_silent = all_zeros;
+      if (latest_settings.use_silence_gate) {
+        // All int16 samples zero <=> all bytes zero; memcmp is ~12x faster than
+        // a scalar early-exit scan on the common all-silent frame.
+        is_silent = std::memcmp(pcm_buffer.data(), silence_ref.data(),
+                                pcm_chunk_size_bytes) == 0;
       }
 
       if (is_silent) {
@@ -380,7 +451,6 @@ private:
                        "Encoding..." << std::endl;
           first_sound_detected = true;
         }
-        chunks_encoded++;
         int encoded_bytes =
             opus_encode(encoder, pcm_buffer.data(), frame_size_per_channel,
                         opus_buffer.data(), max_opus_packet_size);
@@ -391,15 +461,28 @@ private:
           continue;
         }
 
+        chunks_encoded++;
         bytes_encoded += encoded_bytes;
 
         if (encoded_bytes > 0 && chunk_callback) {
+          // When emit is on, prepend the 2-byte header [0x01,0x00] so the payload
+          // is header+opus; when omit (WebRTC), header_sz is 0 and it's raw opus.
+          const int header_sz =
+              emit_audio_header_.load(std::memory_order_relaxed) ? 2 : 0;
+          const int total_sz = header_sz + encoded_bytes;
           AudioChunkEncodeResult result;
-          result.size = encoded_bytes;
-          result.data = new unsigned char[encoded_bytes];
+          result.size = total_sz;
+          result.data = new unsigned char[total_sz];
           result.pts = current_pts;
-          std::memcpy(result.data, opus_buffer.data(), encoded_bytes);
+          if (header_sz) {
+            result.data[0] = 0x01;  // audio chunk tag
+            result.data[1] = 0x00;  // reserved (matches selkies' b'\x01\x00')
+          }
+          std::memcpy(result.data + header_sz, opus_buffer.data(), encoded_bytes);
           chunk_callback(&result, user_data);
+          // Ownership invariant: whoever leaves result.data non-null owns the
+          // single free. The Python wrapper (copy path) or OwnedAudioFrame.take()
+          // (deferred) nulls it; if nobody took it, the dtor below frees it.
         }
       }
 
@@ -408,7 +491,7 @@ private:
           std::chrono::duration_cast<std::chrono::milliseconds>(now -
                                                                 last_log_time)
               .count();
-      if (local_settings.debug_logging && elapsed_ms >= 2000) {
+      if (latest_settings.debug_logging && elapsed_ms >= 2000) {
         double seconds = elapsed_ms / 1000.0;
         double kbps = (bytes_encoded * 8) / (seconds * 1000.0);
         double silent_percent =
@@ -427,6 +510,7 @@ private:
 
     std::cout << "[pcmflux] Stop requested. Cleaning up capture loop..."
               << std::endl;
+    started_ok = false;
     if (encoder)
       opus_encoder_destroy(encoder);
     if (s)
@@ -475,6 +559,9 @@ extern "C" {
                            AudioChunkCallback callback, void* user_data) {
     if (handle) {
       auto module = static_cast<AudioCaptureModule*>(handle);
+      // Join any running capture before mutating the fields the capture thread
+      // reads, so a re-entrant start can't race callback/user_data.
+      module->stop_capture();
       module->modify_settings(settings);
       module->chunk_callback = callback;
       module->user_data = user_data;
@@ -489,10 +576,7 @@ extern "C" {
    */
   void update_audio_bitrate(AudioCaptureModuleHandle handle, int new_bitrate) {
     if (handle) {
-      auto module = static_cast<AudioCaptureModule*>(handle);
-      AudioCaptureSettings current_settings = module->get_current_settings();
-      current_settings.opus_bitrate = new_bitrate;
-      module->modify_settings(current_settings);
+      static_cast<AudioCaptureModule*>(handle)->set_bitrate(new_bitrate);
     }
   }
 
@@ -507,6 +591,14 @@ extern "C" {
     }
   }
 
+  // 1 while the capture thread is up (after PulseAudio/Opus init succeeded);
+  // 0 if it never started, already failed, or was stopped.
+  int is_audio_capture_running(AudioCaptureModuleHandle handle) {
+    if (!handle) return 0;
+    auto module = static_cast<AudioCaptureModule*>(handle);
+    return (module->started_ok.load() && !module->stop_requested.load()) ? 1 : 0;
+  }
+
   /**
    * @brief Frees the data buffer within an AudioChunkEncodeResult.
    * @param result Pointer to the result whose data should be freed.
@@ -516,5 +608,10 @@ extern "C" {
       delete[] result->data;
       result->data = nullptr;
     }
+  }
+
+  // Struct size so Python can assert ctypes/C ABI agreement.
+  int pcmflux_audio_capture_settings_size() {
+    return static_cast<int>(sizeof(AudioCaptureSettings));
   }
 }

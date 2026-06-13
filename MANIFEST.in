@@ -1,1 +1,3 @@
 graft pcmflux
+recursive-exclude pcmflux *.so *.pyc
+prune pcmflux/__pycache__
