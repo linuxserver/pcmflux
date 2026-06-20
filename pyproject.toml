@@ -4,14 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
 archs = [ "x86_64", "aarch64" ]
+manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
+# Build CPython 3.9-3.14 only. Skip free-threaded (cp3XXt) builds: _capture is a
+# full-API (GIL) extension, not a free-threaded one. Skip PyPy (no C-API ext).
+# musllinux is kept (the Alpine `before-all` branch below provisions it).
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*t-* pp*"
 
 [tool.cibuildwheel.linux]
 before-all = """
     set -euxo pipefail
     if command -v dnf; then
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-8.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-9.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
         dnf install -y \
             pulseaudio-libs-devel \
             opus-devel \

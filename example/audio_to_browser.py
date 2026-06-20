@@ -1,5 +1,4 @@
 import asyncio
-import ctypes
 import mimetypes
 import os
 import urllib.parse
@@ -143,32 +142,22 @@ async def ws_handler(websocket, path=None):
             g_audio_queue = None
             print("Audio capture process stopped.")
 
-def py_audio_callback(result_ptr, user_data):
-    """
-    A C-style callback function that bridges the C++ and Python worlds.
+def py_audio_callback(frame):
+    """Per-chunk callback invoked from the C++ capture thread.
 
-    This function is not called directly by Python. It is passed as a function
-    pointer to the C++ `pcmflux` library, which calls it from a separate
-    thread whenever a new Opus audio chunk is encoded.
+    `frame` is a zero-copy AudioFrame (buffer protocol + `.pts`). Copy it to
+    `bytes` here so nothing outlives this call, then hand off to the loop thread
+    for a non-blocking, drop-oldest enqueue. Silence-gated chunks are never
+    delivered (the callback is skipped for them), so `frame` always carries an
+    encoded payload — no empty-frame check is needed.
     """
     global g_is_capturing, g_audio_queue, g_loop
 
-    if g_is_capturing and result_ptr and g_audio_queue is not None:
-        # Dereference the C pointer to access the result struct.
-        result = result_ptr.contents
-        if result.data and result.size > 0:
-            # Convert the raw C data (unsigned char*) into a Python `bytes` object.
-            data_bytes = bytes(ctypes.cast(
-                result.data, ctypes.POINTER(ctypes.c_ubyte * result.size)
-            ).contents)
-
-            # This runs on the capture thread; hand the bytes to the loop thread
-            # for a non-blocking, drop-oldest enqueue.
-            if g_loop and not g_loop.is_closed():
-                g_loop.call_soon_threadsafe(_enqueue_audio, data_bytes)
-
-    # The pcmflux Python wrapper automatically frees the underlying C++ memory
-    # after this function returns.
+    if g_is_capturing and frame is not None and g_audio_queue is not None:
+        # bytes(frame) copies the payload (header+Opus, or raw Opus per settings).
+        data_bytes = bytes(frame)
+        if g_loop and not g_loop.is_closed():
+            g_loop.call_soon_threadsafe(_enqueue_audio, data_bytes)
 
 def _enqueue_audio(data_bytes):
     """Enqueue one chunk on the loop thread, dropping the oldest if the bounded
