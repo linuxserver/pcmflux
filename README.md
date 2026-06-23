@@ -6,7 +6,7 @@ It is designed to capture system audio using PulseAudio, encode it into the Opus
 
 ## Prerequisites
 
-This package compiles a C++ extension and requires the development headers for PulseAudio and Opus to be installed on your system.
+This package builds a native Rust extension (via `setuptools-rust`/PyO3). It requires a Rust toolchain (`cargo`/`rustc`) plus the development headers for PulseAudio and Opus on your system.
 
 On Debian/Ubuntu, you can install them with:
 ```bash
@@ -15,15 +15,16 @@ sudo apt-get install libpulse-dev libopus-dev
 
 ## Core Features
 
-- **PulseAudio Capture:** Uses the `pa_simple` API for efficient, low-level audio capture.
+- **PulseAudio Capture:** Captures system audio via PulseAudio using the asynchronous `Context`/`Stream` record API with a manually-pumped mainloop.
 - **Opus Encoding:** Integrates the high-quality, low-latency Opus codec.
 - **Silence Detection:** Intelligently skips encoding and sending silent audio chunks.
 - **Native Audio Header:** With `omit_audio_header=False` (the default), the encoder prepends a 2-byte `[0x01, 0x00]` header to each chunk natively, so WebSocket transports avoid an extra Python copy. Set it to `True` for raw Opus (WebRTC/RTP).
+- **Optional RED redundancy (RFC 2198):** `red_distance` (0–4, default 0) prepends redundant copies of recent Opus payloads for lossy/unreliable transports; `0` disables it (the default for reliable WebSocket/TCP).
 - **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9–3.14)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe. (The old `deferred_free` / `OwnedAudioFrame` / PEP 688 / Python-3.12-only path is gone; the native buffer protocol does this on all versions.)
 - **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
 - **Live Bitrate Updates:** Thread-safe `update_bitrate()` (alias `update_audio_bitrate()`) adjusts the Opus bitrate during an active session.
-- **CPython C-API Extension:** A native `pcmflux._capture` extension (full API, not Limited/abi3) provides a clean Python API over a high-performance C++ core.
-- **Python Build System:** Uses a robust Python build setup for compiling the C++ module and its dependencies.
+- **PyO3 Extension Module:** A native Rust `pcmflux` extension module (full CPython API, not Limited/abi3) provides PulseAudio capture + Opus encoding.
+- **Python Build System:** Uses `setuptools-rust` to build and package the `pcmflux` PyO3 extension.
 
 ## Usage
 
@@ -61,12 +62,12 @@ capture.stop_capture()
 ### API notes
 
 - `update_bitrate(bps)` / `update_audio_bitrate(bps)` store the new Opus bitrate
-  under a lock; the capture thread re-reads it on the next frame, so it only takes
+  atomically; the capture thread re-reads it on the next frame, so it only takes
   effect during an **active** capture session. Calling it while no capture is
   active is **not** an error — it is a silent no-op store, but the value does
   **not** persist into the next session: the next `start_capture(settings, ...)`
-  calls `modify_settings()` with the passed settings object, which overwrites the
-  stored bitrate with `settings.opus_bitrate`. To change the bitrate for a new
+  snapshots the passed settings object and re-seeds the atomic bitrate mirror from
+  `settings.opus_bitrate`. To change the bitrate for a new
   session, set `settings.opus_bitrate` before `start_capture()`; use
   `update_bitrate()` only to adjust a session that is already running.
   (Earlier releases raised `RuntimeError('Cannot update bitrate when capture is

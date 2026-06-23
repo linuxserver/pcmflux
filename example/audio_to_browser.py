@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 import asyncio
 import mimetypes
 import os
@@ -143,7 +147,7 @@ async def ws_handler(websocket, path=None):
             print("Audio capture process stopped.")
 
 def py_audio_callback(frame):
-    """Per-chunk callback invoked from the C++ capture thread.
+    """Per-chunk callback invoked from the native capture thread.
 
     `frame` is a zero-copy AudioFrame (buffer protocol + `.pts`). Copy it to
     `bytes` here so nothing outlives this call, then hand off to the loop thread
@@ -252,16 +256,23 @@ async def main_async():
     # the name of your output's ".monitor" source. Use `pactl list sources`
     # in a terminal to find available source names.
     # To use the system's default microphone, set device_name to None or b''.
-    g_settings.device_name = b"alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor"
+    # The same variables selkies accepts override the template values here (the
+    # library reads no SELKIES_* environment itself — each knob is a settings field).
+    g_settings.device_name = os.environ.get(
+        "SELKIES_AUDIO_DEVICE_NAME",
+        "alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor",
+    ).encode("utf-8")
     #g_settings.device_name = None
     g_settings.sample_rate = 48000
-    g_settings.channels = 2
-    g_settings.opus_bitrate = 128000
-    g_settings.frame_duration_ms = 20
+    g_settings.channels = int(os.environ.get("SELKIES_AUDIO_CHANNELS", "2"))
+    g_settings.opus_bitrate = int(os.environ.get("SELKIES_AUDIO_BITRATE", "128000"))
+    g_settings.frame_duration_ms = int(
+        os.environ.get("SELKIES_AUDIO_FRAME_DURATION_MS", "20")
+    )
     g_settings.use_vbr = True
     g_settings.use_silence_gate = False
     g_settings.debug_logging = True
-    # Emit the 2-byte audio header [0x01, 0x00] natively in C++ (the default).
+    # Emit the 2-byte audio header [0x01, 0x00] natively in the extension (the default).
     # Set True only for a raw-Opus/WebRTC transport that adds no header.
     g_settings.omit_audio_header = False
     # --- End Configuration ---
@@ -275,8 +286,8 @@ async def main_async():
     http_server = await asyncio.start_server(
         handle_http_request, 'localhost', 9001
     )
-    print(f"HTTP server is serving files from current directory")
-    print(f"-> Open http://localhost:9001/index.html in your browser.")
+    print("HTTP server is serving files from current directory")
+    print("-> Open http://localhost:9001/index.html in your browser.")
 
     # Start the WebSocket server.
     ws_server = await ws_async.serve(
@@ -294,7 +305,7 @@ async def main_async():
     except KeyboardInterrupt:
         pass
     finally:
-        # Stop capture first (joins the C++ thread, stops enqueuing), then cancel
+        # Stop capture first (joins the native capture thread, stops enqueuing), then cancel
         # the consumer tasks, then close the servers.
         print("\nShutting down...")
         if g_module:
@@ -312,7 +323,7 @@ async def main_async():
             if server:
                 server.close()
                 await server.wait_closed()
-        # Drop the last reference so AudioCapture.__del__ releases the C++ module.
+        # Drop the last reference so AudioCapture.__del__ releases the native capture resources.
         if g_module:
             g_module = None
         print("Cleanup complete.")
