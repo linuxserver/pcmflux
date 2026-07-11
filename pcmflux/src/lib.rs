@@ -4,23 +4,34 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// pcmflux: PulseAudio -> Opus audio capture as a pure-Rust PyO3 extension.
-//
-// Concurrency design (the invariants below are load-bearing):
-//   - A lifecycle mutex serializes joining/reassigning the capture thread.
-//   - A single stop_state atomic is the one source of truth (0 = running, -1 =
-//     external stop, a positive value = self-stop by that capture thread's tid). The
-//     external -1 is stored INSIDE that lock immediately before join, so a stop can
-//     never be lost between observing a live thread and asking it to stop. A
-//     re-entrant self-start undoes only its own self-stop via one compare-exchange,
-//     so a racing external stop is never clobbered.
-//   - The PulseAudio mainloop is pumped with a bounded ~20ms timeout, so a stop is
-//     observed within ~20ms even if the audio source delivers no data (is wedged).
-//   - The GIL is released around join, because the capture thread's final callback
-//     needs the GIL; holding it while joining would deadlock.
-//   - A callback may itself call stop/start from the capture thread; that re-entrant
-//     case is detected via the capture thread's OS tid and short-circuits without
-//     self-joining.
+//! pcmflux: PulseAudio/PipeWire audio capture with Opus encoding, plus mic-uplink
+//! playback, exposed as a pure-Rust PyO3 extension (the audio sibling of pixelflux).
+//!
+//! The capture thread pulls S16LE PCM fragments from a PulseAudio record stream,
+//! reassembles them into fixed-size Opus frames, encodes them (mono/stereo via the
+//! `opus` crate, 5.1/7.1 surround via the multistream API), optionally wraps them in
+//! RFC 2198 RED framing — redundant copies of recent frames, so a client on a lossy
+//! transport rebuilds a dropped packet from the next one it receives instead of stalling
+//! for a retransmit — and hands each frame to a delivery thread that runs the Python
+//! callback off the audio path, so a slow or GIL-blocked callback can never stall the
+//! PulseAudio pump. The playback path mirrors this in reverse: it decodes the Opus mic
+//! uplink and writes PCM into a virtual sink.
+//!
+//! Concurrency design (the invariants below are load-bearing):
+//!   - A lifecycle mutex serializes joining/reassigning the capture thread.
+//!   - A single stop_state atomic is the one source of truth (0 = running, -1 =
+//!     external stop, a positive value = self-stop by that capture thread's tid). The
+//!     external -1 is stored INSIDE that lock immediately before join, so a stop can
+//!     never be lost between observing a live thread and asking it to stop. A
+//!     re-entrant self-start undoes only its own self-stop via one compare-exchange,
+//!     so a racing external stop is never clobbered.
+//!   - The PulseAudio mainloop is pumped with a bounded ~20ms timeout, so a stop is
+//!     observed within ~20ms even if the audio source delivers no data (is wedged).
+//!   - The GIL is released around join, because the capture thread's final callback
+//!     needs the GIL; holding it while joining would deadlock.
+//!   - A callback may itself call stop/start from the capture thread; that re-entrant
+//!     case is detected via the capture thread's OS tid and short-circuits without
+//!     self-joining.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -40,16 +51,21 @@ use pulse::time::MicroSeconds;
 
 use opus::{Application, Channels};
 
-// Non-panicking logging. Rust's std println!/eprintln! PANIC on any write error
-// other than EBADF (e.g. EPIPE when a piped stdout reader exits, as in `... | head`).
-// A panic here would otherwise unwind out of the capture thread / callback path; we
-// swallow write errors instead while preserving the exact message text and stream.
+/// @brief Log to stdout without ever panicking, so a broken output pipe can't unwind out
+/// of the capture thread or a Python callback and tear the whole run down.
+///
+/// The reason this exists at all: Rust's std `println!`/`eprintln!` **panic** on any write
+/// error other than EBADF — e.g. EPIPE when a piped stdout reader exits (`... | head`).
+/// That panic would unwind across the capture thread or the Python callback boundary, so
+/// this locks stdout and swallows the write error instead, while preserving the exact
+/// message text and stream.
 macro_rules! plog {
     ($($arg:tt)*) => {{
         use std::io::Write;
         let _ = writeln!(std::io::stdout().lock(), $($arg)*);
     }};
 }
+/// @brief Non-panicking `eprintln!` replacement — the stderr sibling of `plog!`.
 macro_rules! elog {
     ($($arg:tt)*) => {{
         use std::io::Write;
@@ -57,45 +73,86 @@ macro_rules! elog {
     }};
 }
 
+/// @brief Identify the calling thread, so a stop/start issued from inside the Python
+/// callback can tell it is running ON the capture thread and must not try to join itself.
+///
+/// The worker publishes this OS thread id (the Linux `gettid` syscall) into an atomic at
+/// startup; a re-entrant stop/start then compares against it and short-circuits instead of
+/// self-joining, which would otherwise deadlock the thread against its own `join()`.
 #[inline]
 fn gettid() -> i64 {
-    // OS thread id; stored as an atomic so a re-entrant stop/start invoked from
-    // inside the callback can detect it's on the capture thread and avoid self-joining.
     unsafe { libc::syscall(libc::SYS_gettid) as i64 }
 }
 
-// start_state values, published by the capture thread for the startup handshake.
+/// @brief `start_state` handshake value published by the worker: startup in progress.
 const ST_STARTING: u8 = 1;
+/// @brief `start_state` handshake value: the hot loop is running.
 const ST_RUNNING: u8 = 2;
+/// @brief `start_state` handshake value: startup failed (details on stderr).
 const ST_FAILED: u8 = 3;
 
-// stop_state sentinels; any positive value is the tid of a self-stopping capture thread.
+/// @brief `stop_state` sentinel: no stop pending (running).
 const STOP_NONE: i64 = 0;
+/// @brief `stop_state` sentinel: authoritative external stop. Any positive `stop_state`
+/// instead is the OS tid of a capture thread that self-stopped from its own callback.
 const STOP_EXTERNAL: i64 = -1;
 
+/// @brief PulseAudio mainloop pump timeout (~20 ms) — the upper bound on how long a
+/// pending stop can go unobserved even when the audio source delivers nothing.
 const PUMP_TIMEOUT_US: u64 = 20 * 1000;
+/// @brief Per-stream Opus output ceiling in bytes — the upper bound that sizes the emit
+/// buffer pool so an encoded packet is guaranteed to fit; surround scales it by stream count.
 const MAX_OPUS_PACKET: usize = 4000;
 
-// RFC 2198 RED audio redundancy on the WS path (recover NetEQ concealment under
-// loss on future unreliable transports; a null benefit over reliable TCP by design).
-// The timestamp offset is a 14-bit field and the block length a 10-bit field, so a
-// redundant history block that overflows either is dropped. blockPT is nominal on
-// the WS path -- the client decodes only the primary block as Opus.
+/// @brief Max RFC 2198 RED timestamp offset — the 14-bit offset field's ceiling, in
+/// 48 kHz samples back from the primary. RED recovers NetEQ concealment under packet
+/// loss on unreliable transports; over reliable TCP it is redundant by design. A
+/// history block whose offset overflows this is dropped.
 const RED_MAX_OFFSET: u64 = 16383;
+/// @brief Max RFC 2198 RED block length — the 10-bit length field's ceiling, in bytes.
+/// A redundant packet larger than this is dropped.
 const RED_MAX_LEN: usize = 1023;
+/// @brief RFC 2198 RED block payload type. Nominal on the WS path, where the client
+/// decodes only the primary block as Opus.
 const RED_BLOCK_PT: u8 = 0;
+/// @brief Max redundant copies carried per frame, and the RED history depth — the ceiling
+/// on how many consecutive lost packets can still be recovered, traded against the extra
+/// bandwidth every redundant copy costs on the wire.
 const RED_MAX_DISTANCE: i32 = 4;
 
-// Assemble the WS audio frame body from the encoded primary packet and its
-// redundant history per the shared RFC 2198 RED contract. `history` is ordered
-// oldest-first (front = oldest, largest timestamp offset). Redundant blocks whose
-// 48 kHz sample offset or byte length overflow the RFC 2198 fields are skipped, so
-// the emitted count reflects only what fit. With `red_distance == 0` the output is
-// byte-identical to the legacy [0x01,0x00]+opus frame; with the header omitted there
-// is no [0x01,n] prefix at all (the header carries the count), so the raw opus is
-// returned unchanged -- the pre-RED omit-header behavior.
-// Reference implementation of the frame layout: the runtime path assembles the same
-// bytes in place via write_ws_prefix_into (equality is unit-tested against this).
+/// @brief The readable reference oracle for the WS audio frame body — the encoded primary
+/// Opus packet plus its RFC 2198 RED redundant history. It exists so the fast, pooled,
+/// in-place `write_ws_prefix_into` on the hot path has a simple allocating definition of
+/// the exact wire bytes to be asserted byte-for-byte equal against. `#[cfg(test)]` only;
+/// the runtime never calls it.
+///
+/// RED carries redundant copies of recent frames alongside each primary, so a client on a
+/// lossy transport can rebuild a dropped packet from the next one it receives with no
+/// retransmit — that packet-loss concealment is the whole reason the layout below exists.
+///
+/// `history` is oldest-first (front = oldest, largest timestamp offset back from
+/// `primary_pts`). The layout is chosen by `emit_header` and `red_distance`:
+///
+/// 1. **Header omitted** (`!emit_header`): the raw primary Opus packet, with no framing
+///    bytes — the header is what carries the redundant-block count, so without it there
+///    is no `[0x01,n]` prefix.
+/// 2. **`red_distance == 0`, or no usable redundancy**: the 2-byte `[0x01, 0x00]` framing
+///    then the primary. On this wire `n_red == 0` must mean **exactly** those two bytes,
+///    so a first frame after a (re)start (empty history) collapses here too; emitting a
+///    lone primary-only RED header instead would be mis-stripped by the client's
+///    `n_red == 0` path and corrupt the frame.
+/// 3. **`red_distance > 0` with usable history**: the full RFC 2198 RED framing —
+///    - `0x01` audio-chunk tag, then `n_red` (count of redundant blocks that actually fit).
+///    - The primary timestamp (low 32 bits, big-endian), letting the client order and dedup
+///      recovered frames against what it has already played.
+///    - One 4-byte header per redundant block, oldest-first: `0x80 | PT` (F bit set,
+///      i.e. another block follows), then `(offset14 << 10) | len10` big-endian.
+///    - The 1-byte primary block header (`PT`, F bit clear).
+///    - The block payloads in that same order: redundant oldest-first, then the primary.
+///
+/// A redundant block whose 48 kHz sample offset overflows `RED_MAX_OFFSET` (14 bits) or
+/// whose byte length overflows `RED_MAX_LEN` (10 bits) is skipped, so `n_red` counts only
+/// what fit.
 #[cfg(test)]
 fn build_ws_body(
     primary: &[u8],
@@ -109,13 +166,11 @@ fn build_ws_body(
     }
     if red_distance == 0 {
         let mut out = Vec::with_capacity(2 + primary.len());
-        out.push(0x01); // audio chunk tag
-        out.push(0x00); // n_red == 0 (legacy reserved byte)
+        out.push(0x01);
+        out.push(0x00);
         out.extend_from_slice(primary);
         return out;
     }
-    // Redundant blocks, oldest-first, capped at red_distance and filtered to the
-    // RFC 2198 field ranges.
     let start = history.len().saturating_sub(red_distance);
     let mut blocks: Vec<(&[u8], u32)> = Vec::with_capacity(red_distance);
     for (data, pts) in history.iter().skip(start) {
@@ -126,10 +181,6 @@ fn build_ws_body(
         blocks.push((data.as_slice(), offset as u32));
     }
     if blocks.is_empty() {
-        // No usable redundancy yet (first frame after a (re)start, or all history out of
-        // range): fall back to the legacy 2-byte framing. On this wire n_red==0 must mean
-        // exactly [0x01,0x00]+opus, so a primary-only RED header here would be mis-stripped
-        // by the client's legacy path and corrupt the frame.
         let mut out = Vec::with_capacity(2 + primary.len());
         out.push(0x01);
         out.push(0x00);
@@ -138,22 +189,17 @@ fn build_ws_body(
     }
     let redundant_bytes: usize = blocks.iter().map(|(d, _)| d.len()).sum();
     let mut out = Vec::with_capacity(6 + 4 * blocks.len() + 1 + redundant_bytes + primary.len());
-    out.push(0x01); // audio chunk tag
-    out.push(blocks.len() as u8); // n_red (always >= 1 here)
-    // Primary timestamp (low 32 bits, big-endian): lets the client order and dedup
-    // recovered frames against what it has already played.
+    out.push(0x01);
+    out.push(blocks.len() as u8);
     out.extend_from_slice(&(primary_pts as u32).to_be_bytes());
-    // Redundant block headers (4 bytes): F|PT, then (offset14 << 10 | len10) big-endian.
     for (data, offset) in &blocks {
-        out.push(0x80 | (RED_BLOCK_PT & 0x7F)); // F bit set: another block follows
+        out.push(0x80 | (RED_BLOCK_PT & 0x7F));
         let word = ((offset & 0x3FFF) << 10) | (data.len() as u32 & 0x3FF);
         out.push((word >> 16) as u8);
         out.push((word >> 8) as u8);
         out.push(word as u8);
     }
-    // Primary (final) block header: 1 byte, F bit clear.
     out.push(RED_BLOCK_PT & 0x7F);
-    // Block data, same order: redundant oldest-first, then primary.
     for (data, _) in &blocks {
         out.extend_from_slice(data);
     }
@@ -161,15 +207,32 @@ fn build_ws_body(
     out
 }
 
-// Worst-case build_ws_body prefix: tag + n_red + 4-byte pts + RED_MAX_DISTANCE 4-byte
-// block headers + the 1-byte primary header + the redundant block data itself.
+/// @brief Worst-case byte length of the WS frame PREFIX: tag + `n_red` + the 4-byte pts +
+/// `RED_MAX_DISTANCE` 4-byte block headers + the 1-byte primary header + the redundant
+/// block payloads themselves. Sizes the buffer pool so the prefix always fits.
 const RED_PREFIX_MAX: usize =
     6 + 4 * RED_MAX_DISTANCE as usize + 1 + RED_MAX_DISTANCE as usize * RED_MAX_LEN;
 
-// The same framing as build_ws_body, but writing only the PREFIX (everything before
-// the primary payload) into `buf`, so the encoder can serialize the primary directly
-// into its final buffer. Returns the prefix length; `buf` must hold at least
-// RED_PREFIX_MAX bytes when emit_header && red_distance > 0 (2 otherwise).
+/// @brief Emit the RFC 2198 RED framing PREFIX (everything before the primary payload) into
+/// `buf` in place and return its length, so the encoder can serialize the primary Opus
+/// packet DIRECTLY after it and the frame is assembled with no scratch buffer and no
+/// per-frame allocation. This runs on every captured frame, so an assembly copy here would
+/// be pure steady-state overhead — the in-place split is the point of the function.
+///
+/// The runtime counterpart of `build_ws_body` — byte-for-byte the same framing (asserted
+/// equal in tests), but split so the caller appends the primary itself:
+///
+/// 1. **Header omitted**: returns `0`; the caller emits the raw primary with no prefix.
+/// 2. **`red_distance > 0` with usable history**: writes the full RED header — tag,
+///    `n_red`, the primary timestamp (low 32 bits, big-endian), one 4-byte header per
+///    redundant block (F bit set, then `(offset14 << 10) | len10`), the 1-byte primary
+///    header (F bit clear), and the redundant block payloads oldest-first. Usable blocks
+///    are selected by history index into a fixed `RED_MAX_DISTANCE` array — the distance is
+///    clamped at ingest, so this allocates nothing.
+/// 3. **`red_distance == 0`, or no usable redundancy**: the 2-byte `[0x01, 0x00]` framing.
+///
+/// `buf` must hold at least `RED_PREFIX_MAX` bytes when `emit_header && red_distance > 0`,
+/// and at least 2 bytes otherwise.
 fn write_ws_prefix_into(
     buf: &mut [u8],
     primary_pts: u64,
@@ -183,8 +246,6 @@ fn write_ws_prefix_into(
     if red_distance > 0 {
         debug_assert!(red_distance <= RED_MAX_DISTANCE as usize);
         let start = history.len().saturating_sub(red_distance);
-        // Usable blocks (RFC 2198 field-range filtered) by history index; the
-        // distance is clamped at ingest, so a fixed array avoids any allocation.
         let mut idx = [0usize; RED_MAX_DISTANCE as usize];
         let mut n = 0usize;
         for (i, (data, pts)) in history.iter().enumerate().skip(start) {
@@ -195,22 +256,21 @@ fn write_ws_prefix_into(
             }
         }
         if n > 0 {
-            buf[0] = 0x01; // audio chunk tag
-            buf[1] = n as u8; // n_red (always >= 1 here)
-            // Primary timestamp (low 32 bits, big-endian) for client-side RED recovery.
+            buf[0] = 0x01;
+            buf[1] = n as u8;
             buf[2..6].copy_from_slice(&(primary_pts as u32).to_be_bytes());
             let mut i = 6;
             for &k in &idx[..n] {
                 let (data, pts) = &history[k];
                 let offset = primary_pts.saturating_sub(*pts) as u32;
-                buf[i] = 0x80 | (RED_BLOCK_PT & 0x7F); // F bit set: another block follows
+                buf[i] = 0x80 | (RED_BLOCK_PT & 0x7F);
                 let word = ((offset & 0x3FFF) << 10) | (data.len() as u32 & 0x3FF);
                 buf[i + 1] = (word >> 16) as u8;
                 buf[i + 2] = (word >> 8) as u8;
                 buf[i + 3] = word as u8;
                 i += 4;
             }
-            buf[i] = RED_BLOCK_PT & 0x7F; // primary (final) block header, F bit clear
+            buf[i] = RED_BLOCK_PT & 0x7F;
             i += 1;
             for &k in &idx[..n] {
                 let data = &history[k].0;
@@ -220,13 +280,13 @@ fn write_ws_prefix_into(
             return i;
         }
     }
-    // Legacy 2-byte framing (red_distance == 0, or no usable redundancy yet).
     buf[0] = 0x01;
     buf[1] = 0x00;
     2
 }
 
-/// Capture/encode settings, snapshotted from the Python `AudioCaptureSettings`.
+/// @brief Capture/encode settings, snapshotted from the Python `AudioCaptureSettings`
+/// at start so the capture thread owns an immutable copy for the run's lifetime.
 #[derive(Clone)]
 struct Settings {
     device_name: Option<String>,
@@ -242,13 +302,17 @@ struct Settings {
     red_distance: i32,
 }
 
+/// @brief True if `ms` is a valid Opus frame duration (2.5, 5, 10, 20, 40, or 60 ms).
+///
+/// The comparison is done in tenths of a millisecond (`round(ms * 10)`) so the fractional
+/// 2.5 ms case is accepted exactly, without float-equality pitfalls.
 fn valid_opus_duration(ms: f64) -> bool {
-    // Opus frame sizes: 2.5, 5, 10, 20, 40, 60 ms. Compare in tenths to accept the
-    // fractional 2.5 without float-equality pitfalls.
     matches!((ms * 10.0).round() as i64, 25 | 50 | 100 | 200 | 400 | 600)
 }
 
-// device_name: str | bytes | None  ("" => default). Shared by capture + playback.
+/// @brief Normalize a Python `device_name` (`str | bytes | None`) into `Option<String>`,
+/// mapping both `None` and the empty string to `None` (meaning the system default).
+/// Shared by the capture and playback settings extractors.
 fn parse_device_name(dev_obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     if dev_obj.is_none() {
         Ok(None)
@@ -264,6 +328,10 @@ fn parse_device_name(dev_obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     }
 }
 
+/// @brief Read a Python `AudioCaptureSettings` into a Rust `Settings` by attribute name.
+///
+/// `red_distance` is clamped into `[0, RED_MAX_DISTANCE]` — it selects how many redundant
+/// Opus copies each frame carries, and cannot exceed the RFC 2198 history depth.
 fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
     let device_name = parse_device_name(&s.getattr("device_name")?)?;
     Ok(Settings {
@@ -277,12 +345,12 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
         debug_logging: s.getattr("debug_logging")?.extract()?,
         latency_ms: s.getattr("latency_ms")?.extract()?,
         omit_audio_header: s.getattr("omit_audio_header")?.extract()?,
-        // Redundant Opus copies per frame; clamped to the RFC 2198 history depth.
         red_distance: s.getattr("red_distance")?.extract::<i32>()?.clamp(0, RED_MAX_DISTANCE),
     })
 }
 
-/// Playback settings, snapshotted from the Python `AudioPlaybackSettings`.
+/// @brief Playback settings, snapshotted from the Python `AudioPlaybackSettings` at
+/// start so the playback thread owns an immutable copy for the run's lifetime.
 #[derive(Clone)]
 struct PbSettings {
     device_name: Option<String>,
@@ -293,6 +361,7 @@ struct PbSettings {
     debug_logging: bool,
 }
 
+/// @brief Read a Python `AudioPlaybackSettings` into a Rust `PbSettings` by attribute name.
 fn extract_pb_settings(s: &Bound<'_, PyAny>) -> PyResult<PbSettings> {
     Ok(PbSettings {
         device_name: parse_device_name(&s.getattr("device_name")?)?,
@@ -304,15 +373,15 @@ fn extract_pb_settings(s: &Bound<'_, PyAny>) -> PyResult<PbSettings> {
     })
 }
 
-// ============================================================================
-// AudioCaptureSettings: capture/encode configuration read by start_capture.
-// Declared `dict` so callers may stash extra attributes; the fields below are
-// read by attribute name (see extract_settings).
-// ============================================================================
+/// @brief Python-facing capture/encode configuration read by `start_capture`.
+///
+/// Declared `#[pyclass(dict)]` so callers may stash extra attributes on instances; the
+/// fields below are the ones read by attribute name in `extract_settings`. `device_name`
+/// accepts `str | bytes | None`.
 #[pyclass(dict)]
 struct AudioCaptureSettings {
     #[pyo3(get, set)]
-    device_name: Py<PyAny>, // str | bytes | None
+    device_name: Py<PyAny>,
     #[pyo3(get, set)]
     sample_rate: u32,
     #[pyo3(get, set)]
@@ -333,8 +402,8 @@ struct AudioCaptureSettings {
     omit_audio_header: bool,
     #[pyo3(get, set)]
     red_distance: i32,
-    // Informational parity field with pixelflux: frames always own their buffers
-    // (freed/recycled on last reference), so holding a frame past the callback is safe.
+    /// Informational parity field with pixelflux: frames always own their buffers
+    /// (freed/recycled on last reference), so holding a frame past the callback is safe.
     #[pyo3(get, set)]
     deferred_free: bool,
 }
@@ -360,15 +429,15 @@ impl AudioCaptureSettings {
     }
 }
 
-// ============================================================================
-// AudioPlaybackSettings: mic-playback configuration read by AudioPlayback.start.
-// Defaults match the client mic wire (s16le / mono / 24 kHz); max_buffer_bytes is
-// the single bytes bound for the drop-oldest queue (~2s @24k mono s16).
-// ============================================================================
+/// @brief Python-facing mic-playback configuration read by `AudioPlayback.start`.
+///
+/// Defaults match the client mic wire (S16LE / mono / 24 kHz). `max_buffer_bytes` is the
+/// single byte bound on the drop-oldest playback queue (~2 s at 24 kHz mono s16), and
+/// `device_name` accepts `str | bytes | None`.
 #[pyclass]
 struct AudioPlaybackSettings {
     #[pyo3(get, set)]
-    device_name: Py<PyAny>, // str | bytes | None
+    device_name: Py<PyAny>,
     #[pyo3(get, set)]
     sample_rate: u32,
     #[pyo3(get, set)]
@@ -396,15 +465,17 @@ impl AudioPlaybackSettings {
     }
 }
 
-// ============================================================================
-// AudioFrame: zero-copy buffer-protocol result type (owns the Vec; when Python
-// frees it, a pooled buffer is recycled back to the capture thread).
-// ============================================================================
+/// @brief Zero-copy buffer-protocol result type handed to the Python callback.
+///
+/// Owns its `Vec<u8>` and exposes it read-only through the buffer protocol, so Python can
+/// read the encoded frame without a copy. When the last Python reference is released and
+/// the frame is dropped, a pooled buffer is recycled back to the capture thread (see the
+/// `Drop` impl), keeping the steady-state emit path allocation-free.
 #[pyclass]
 struct AudioFrame {
     data: Vec<u8>,
     pts: u64,
-    // Set when the buffer came from a capture's BufferPool; recycled on drop.
+    /// Set when the buffer came from a capture's `BufferPool`; recycled to it on drop.
     pool: Option<Arc<BufferPool>>,
 }
 
@@ -427,8 +498,11 @@ impl AudioFrame {
         self.pts
     }
 
-    // PyBuffer_FillInfo INCREFs `slf` into view->obj, pinning the Vec until every
-    // memoryview/slice is released (zero-copy, readonly).
+    /// @brief Expose the owned bytes to Python's buffer protocol without a copy.
+    ///
+    /// `PyBuffer_FillInfo` INCREFs `slf` into `view->obj`, pinning the `Vec` alive until
+    /// every `memoryview` / slice over it is released. The view is readonly, so the
+    /// consumer cannot mutate the encoded frame.
     unsafe fn __getbuffer__(
         slf: PyRefMut<'_, Self>,
         view: *mut pyo3::ffi::Py_buffer,
@@ -439,7 +513,7 @@ impl AudioFrame {
             slf.as_ptr(),
             slf.data.as_ptr() as *mut std::os::raw::c_void,
             slf.data.len() as pyo3::ffi::Py_ssize_t,
-            1, // readonly
+            1,
             flags,
         );
         if r != 0 {
@@ -451,19 +525,27 @@ impl AudioFrame {
     unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
-// ============================================================================
-// Shared state + lifecycle.
-// ============================================================================
+/// @brief Lock-free shared state for one capture (or playback) run: the lifecycle
+/// state machine plus the per-frame settings mirrors the worker reads on the hot path.
+///
+/// The lifecycle is driven by two atomics — `stop_state` (the single source of truth for
+/// "should this run stop") and `start_state` (the STARTING → RUNNING/FAILED startup
+/// handshake) — plus `capture_tid`, the worker's OS tid used to detect a re-entrant
+/// stop/start issued from inside the Python callback. The remaining atomics mirror
+/// settings the worker consults each frame, so `update_audio_bitrate` and the silence /
+/// header flags can change mid-run without locking or re-snapshotting `Settings`.
 struct Inner {
-    // One source of truth for the lifecycle: STOP_NONE (running), STOP_EXTERNAL, or a
-    // positive tid meaning that capture thread self-stopped. A re-entrant start clears
-    // only its own self-stop via compare-exchange, so it can't clobber an external stop
-    // that raced in mid-join (which would strand the join forever).
+    /// Single lifecycle source of truth: `STOP_NONE` (running), `STOP_EXTERNAL`, or a
+    /// positive tid meaning that capture thread self-stopped from its own callback. A
+    /// re-entrant start clears only its own self-stop via compare-exchange, so it can
+    /// never clobber an external stop that raced in mid-join (which would strand it).
     stop_state: AtomicI64,
     started_ok: AtomicBool,
     start_state: AtomicU8,
-    capture_tid: AtomicI64, // OS tid of the running capture thread, 0 = none
-    // Lock-free per-frame settings mirrors (published by start/update_bitrate).
+    /// OS tid of the running capture thread; `0` when no worker is live.
+    capture_tid: AtomicI64,
+    /// Lock-free per-frame settings mirrors, published by start / `update_bitrate` and
+    /// re-read by the worker each frame.
     opus_bitrate: AtomicI32,
     use_silence_gate: AtomicBool,
     debug_logging: AtomicBool,
@@ -484,48 +566,56 @@ impl Inner {
         }
     }
 
-    // The stop_state protocol lives here as the single source of truth. An external
-    // stop is authoritative and wins any race; a self-stop/self-start only mutates
-    // state it owns, so it can never clobber an in-flight external stop (whose join
-    // would then hang forever).
-
-    // Authoritative external stop, published before join. Stored unconditionally.
+    /// @brief Request an authoritative external stop, stored unconditionally.
+    ///
+    /// The single source of truth for stopping a run. External stops win every race: they
+    /// are published (inside the lifecycle lock, immediately before join) with a plain
+    /// store, so a concurrent self-stop/self-start — which only ever compare-exchanges
+    /// state it owns — can never clobber one and strand the join forever.
     fn request_external_stop(&self) {
         self.stop_state.store(STOP_EXTERNAL, Ordering::Release);
     }
 
-    // Re-entrant self-stop from the capture thread's own callback. Only transitions
-    // from running, so it never overwrites a pending external stop.
+    /// @brief Record a re-entrant self-stop from the capture thread's own callback.
+    ///
+    /// Only transitions `STOP_NONE -> me` via compare-exchange, so it never overwrites a
+    /// pending external stop (which must win the join).
     fn request_self_stop(&self, me: i64) {
         let _ = self
             .stop_state
             .compare_exchange(STOP_NONE, me, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    // Re-entrant self-start: undo only our own self-stop. If an external stop landed
-    // in between, the CAS fails and that stop stands (never cleared).
+    /// @brief Undo a re-entrant self-stop (self-start from inside the callback).
+    ///
+    /// Compare-exchanges `me -> STOP_NONE`, clearing the stop only if this same thread
+    /// still owns it. If an external stop landed in between, the CAS fails and that stop
+    /// stands.
     fn undo_self_stop(&self, me: i64) {
         let _ = self
             .stop_state
             .compare_exchange(me, STOP_NONE, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    // Clear to running. Only ever called under the lifecycle lock (after join, before
-    // spawn), where no external stop can be in flight -- the lost-stop invariant.
+    /// @brief Clear the stop state back to running. Only ever called under the lifecycle
+    /// lock (after join, before spawn), where no external stop can be in flight — the
+    /// lost-stop invariant that lets this be an unconditional store.
     fn clear_stop(&self) {
         self.stop_state.store(STOP_NONE, Ordering::Release);
     }
 
-    // True once any stop (external or self) is pending; the capture loop uses this.
+    /// @brief True once any stop (external or self) is pending; the hot loops poll this.
     fn stop_pending(&self) -> bool {
         self.stop_state.load(Ordering::Acquire) != STOP_NONE
     }
 
-    // True while a worker thread is (or is still becoming) live: the startup
-    // handshake is in flight, or the hot loop is running with no stop pending.
-    // False once the worker failed, was stopped, or died mid-run (the hot loop
-    // clears started_ok before exiting on error), so producers can surface a dead
-    // stream instead of feeding state nothing services.
+    /// @brief True while a worker is (or is still becoming) live: the startup handshake
+    /// is in flight, or the hot loop is running with no stop pending.
+    ///
+    /// Goes false the moment the worker fails, is stopped, or dies mid-run — the hot loop
+    /// clears `started_ok` before breaking on error, even with no stop pending and
+    /// `start_state` still `RUNNING`. Producers (e.g. `AudioPlayback::write`) gate on this
+    /// so they surface a dead stream instead of feeding state nothing services.
     fn worker_alive(&self) -> bool {
         if self.start_state.load(Ordering::Acquire) == ST_STARTING {
             return true;
@@ -534,24 +624,40 @@ impl Inner {
     }
 }
 
+/// @brief Per-`AudioCapture` shared handle: the lock-free `Inner` state plus the
+/// lifecycle-locked join handle for the capture thread.
 struct Shared {
     inner: Arc<Inner>,
-    // The lifecycle lock: serializes joinable/join/reassign of the capture thread.
+    /// Lifecycle lock: serializes take/join/reassign of the capture thread's handle.
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-// Registry of live captures for the atexit sweep (weak so it keeps nothing alive).
+/// @brief Process-wide registry of live captures, swept at interpreter exit. Holds `Weak`
+/// references so it keeps nothing alive on its own.
 static REGISTRY: OnceLock<Mutex<Vec<Weak<Shared>>>> = OnceLock::new();
+/// @brief Lazily initialize and return the capture registry.
 fn registry() -> &'static Mutex<Vec<Weak<Shared>>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-// Locked takeover + spawn, shared by the capture and playback starts: stop/join any
-// prior worker, reset the lifecycle atomics, spawn `body` on a named thread, and
-// publish its JoinHandle. The external stop is set INSIDE the lock immediately
-// before the join, and cleared to STOP_NONE ONLY here under the lock (after join,
-// before spawn) -- the lost-stop invariant. Returns the spawned thread's id (None if
-// the spawn failed), the identity a failed start hands to join_failed_start.
+/// @brief Locked takeover + spawn of a worker thread, shared by the capture and playback
+/// starts. Returns the new thread's id, or `None` if the spawn failed.
+///
+/// Under the lifecycle lock, in order:
+///
+/// 1. **Stop and join any prior worker**: sets the external stop INSIDE the lock,
+///    immediately before `join()`, then clears `capture_tid` — the set-before-join
+///    ordering that makes the lost-stop invariant hold.
+/// 2. **Reset the lifecycle atomics**: clears `stop_state` back to `STOP_NONE` (done ONLY
+///    here, under the lock, after the join and before the spawn, where no external stop
+///    can be in flight), and arms the startup handshake at `ST_STARTING`.
+/// 3. **Spawn `body` on a named thread**: the thread applies a best-effort `nice` boost
+///    (audio must not stutter when the captured workload saturates the CPU; EPERM without
+///    `CAP_SYS_NICE` is silently a no-op), publishes its OS tid into `capture_tid` for the
+///    re-entrancy guard, runs `body`, then clears the tid on exit.
+///
+/// The returned `ThreadId` is the identity a failed start later hands to
+/// `join_failed_start`, so a losing start tears down only the thread it spawned.
 fn spawn_worker(
     slot: &Mutex<Option<JoinHandle<()>>>,
     inner: &Arc<Inner>,
@@ -569,8 +675,6 @@ fn spawn_worker(
     inner.start_state.store(ST_STARTING, Ordering::Release);
     let t_inner = inner.clone();
     match std::thread::Builder::new().name(name.into()).spawn(move || {
-        // Best-effort nice boost: audio must not stutter when the captured workload
-        // saturates the CPU. EPERM without CAP_SYS_NICE -> silently a no-op.
         unsafe {
             let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
             let _ = libc::setpriority(libc::PRIO_PROCESS, tid, -15);
@@ -588,35 +692,36 @@ fn spawn_worker(
     }
 }
 
-// Failed-start teardown: stop + join the thread `spawned` by THIS start attempt,
-// but only if it still owns the slot. A concurrent start may have already joined it
-// and published a live replacement, which must not be torn down (ThreadIds are
-// never reused within a process, so the identity check cannot false-match).
+/// @brief Failed-start teardown: stop and join the thread `spawned` by THIS start attempt,
+/// but only if it still owns the slot.
+///
+/// A concurrent start may have already joined this thread and published a live replacement,
+/// which must not be torn down. The guard is an identity check: `ThreadId`s are never reused
+/// within a process, so it cannot false-match. When it does own the slot, the external stop
+/// is set INSIDE the lock before `join()`, matching every other join site (the
+/// set-before-join / lost-stop invariant).
 fn join_failed_start(slot: &Mutex<Option<JoinHandle<()>>>, inner: &Inner, spawned: ThreadId) {
     let mut guard = slot.lock().unwrap();
     if guard.as_ref().map(|h| h.thread().id()) != Some(spawned) {
         return;
     }
     if let Some(handle) = guard.take() {
-        // Set the stop INSIDE the lock before join, matching every other join site
-        // (the set-before-join / lost-stop invariant).
         inner.request_external_stop();
         let _ = handle.join();
         inner.capture_tid.store(0, Ordering::Release);
     }
 }
 
-// ============================================================================
-// Playback: mic-PCM handoff into the virtual "input" sink.
-// ============================================================================
-
-// Bounded byte queue with drop-oldest overflow, collapsing selkies' two-stage
-// (chunk queue + reassembly bytearray) mic buffering into one bound. push runs on
-// the Python side (GIL released); drain_upto runs on the playback thread.
+/// @brief Bounded, drop-oldest byte queue for the mic-PCM handoff into the virtual
+/// "input" sink — the whole of the playback path's buffering in a single bound.
+///
+/// `push` runs on the Python side with the GIL released; `drain_upto` runs on the
+/// playback thread. Overflow discards the OLDEST bytes, keeping the newest window (mic
+/// audio is drift-tolerant and stale samples are worthless).
 struct PlayQueue {
     buf: Mutex<VecDeque<u8>>,
-    // Bounds are (re)published by start(); atomics so start can reconfigure the
-    // Arc-shared queue without swapping it. frame_bytes >= 1 (set at new()).
+    /// Bounds (re)published by `start()`; atomics so a restart can reconfigure the
+    /// `Arc`-shared queue in place without swapping it. `frame_bytes >= 1` (set at `new()`).
     max_bytes: AtomicUsize,
     frame_bytes: AtomicUsize,
 }
@@ -630,7 +735,8 @@ impl PlayQueue {
         }
     }
 
-    // Apply this run's bounds and drop any stale audio from a prior run.
+    /// @brief Apply this run's byte bound and frame alignment, and drop any stale audio
+    /// left from a prior run. `frame_bytes` is floored to 1 and the bound to `frame_bytes`.
     fn configure(&self, max_bytes: usize, frame_bytes: usize) {
         let fb = frame_bytes.max(1);
         self.frame_bytes.store(fb, Ordering::Relaxed);
@@ -638,7 +744,8 @@ impl PlayQueue {
         self.buf.lock().unwrap().clear();
     }
 
-    // Append client PCM; drop the OLDEST bytes past the bound (drift-tolerant).
+    /// @brief Append client PCM, dropping the OLDEST bytes once the queue passes the
+    /// byte bound so the newest audio is always retained.
     fn push(&self, data: &[u8]) {
         let max = self.max_bytes.load(Ordering::Relaxed);
         let mut q = self.buf.lock().unwrap();
@@ -648,8 +755,8 @@ impl PlayQueue {
         }
     }
 
-    // Drain up to `n` bytes, clamped to what's queued and floored to a whole frame
-    // (PA write requires a multiple of the sample-spec frame size).
+    /// @brief Drain up to `n` bytes into `out`, clamped to what is queued and floored to a
+    /// whole frame, since a PA write must be a multiple of the sample-spec frame size.
     fn drain_upto(&self, n: usize, out: &mut Vec<u8>) {
         let fb = self.frame_bytes.load(Ordering::Relaxed);
         let mut q = self.buf.lock().unwrap();
@@ -660,18 +767,24 @@ impl PlayQueue {
     }
 }
 
-// Opus mic-uplink decoder: decodes one packet to interleaved S16LE PCM, reusing a
-// scratch buffer. Lives behind a Mutex on PbShared and is driven from write().
+/// @brief Turns the mic uplink back into PCM: the client always sends the mic as Opus, so
+/// every inbound packet must be decoded before it can be queued for the virtual sink. It
+/// decodes one packet to interleaved S16LE PCM, reusing a scratch buffer across calls to
+/// stay off the per-decode allocation path. Lives behind a `Mutex` on `PbShared` and is
+/// driven from `write` / `write_red`.
 struct OpusPlaybackDecoder {
     dec: opus::Decoder,
     channels: usize,
     pcm: Vec<i16>,
-    // RED recovery cursor (RFC 2198): timestamp of the last frame decoded, so a redundant
-    // copy of a dropped frame is decoded once, in order. None until the first RED frame.
+    /// RFC 2198 RED recovery cursor: the timestamp of the last frame decoded, so a
+    /// redundant copy of a dropped frame is decoded exactly once, in order. `None` until
+    /// the first RED frame arrives.
     last_ts: Option<i64>,
 }
 
 impl OpusPlaybackDecoder {
+    /// @brief Create a mono/stereo Opus decoder for the mic uplink; `None` if creation
+    /// fails. `channels <= 1` decodes as mono, otherwise stereo.
     fn new(sample_rate: u32, channels: i32) -> Option<Self> {
         let ch = if channels <= 1 { Channels::Mono } else { Channels::Stereo };
         let dec = opus::Decoder::new(sample_rate, ch).ok()?;
@@ -683,11 +796,16 @@ impl OpusPlaybackDecoder {
         })
     }
 
+    /// @brief Decode one Opus packet into interleaved S16LE PCM bytes, or `None` for an
+    /// empty or undecodable packet.
+    ///
+    /// The scratch `pcm` buffer is grown once to `5760 * channels` — an Opus packet decodes
+    /// to at most 120 ms, which is 5760 samples per channel at 48 kHz — then reused across
+    /// calls. The decoded samples are serialized little-endian into a fresh `Vec<u8>`.
     fn decode_to_pcm(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         if packet.is_empty() {
             return None;
         }
-        // An Opus packet decodes to at most 120 ms; 5760 samples/channel covers 48 kHz.
         let cap = 5760 * self.channels;
         if self.pcm.len() < cap {
             self.pcm.resize(cap, 0);
@@ -701,11 +819,28 @@ impl OpusPlaybackDecoder {
         Some(out)
     }
 
-    // RFC 2198 RED: de-frame the payload, use the redundant copies to recover frames the
-    // sender dropped, and decode each new frame once into `queue` -- all off the GIL. Blocks
-    // are ordered oldest-first (redundant, then primary); each carries a 14-bit timestamp
-    // offset back from `primary_ts`, so a block strictly newer than the last decoded frame
-    // fills a gap left by a dropped packet.
+    /// @brief Reconstruct the mic uplink across packet loss: recover any frames the sender
+    /// dropped from the redundant copies RED carries, and decode each new frame exactly once
+    /// into `queue`. This is what lets a lossy UDP/WebRTC uplink play through gaps without ever
+    /// waiting for a retransmit. It all runs off the GIL — the work is pure byte-slicing plus
+    /// Opus decode with no Python state, so releasing the GIL keeps the mic path from
+    /// serializing behind the rest of the interpreter.
+    ///
+    /// 1. **Parse the block headers**: walk the redundant headers (F bit set) collecting each
+    ///    block's 14-bit timestamp offset and 10-bit length, then consume the 1-byte primary
+    ///    header (F bit clear). A truncated payload, or more redundancy than `RED_MAX_DISTANCE`,
+    ///    bails out.
+    /// 2. **Resolve block boundaries**: turn the headers into `(ts, start, len)` triples,
+    ///    oldest-first, where each redundant `ts` is `primary_ts - offset` and the primary is
+    ///    whatever bytes remain.
+    /// 3. **Anchor the first packet**: with no prior `last_ts`, decode only the primary and set
+    ///    `last_ts` to it — its trailing redundancy describes frames never played, so it is not
+    ///    replayed.
+    /// 4. **Recover and advance**: otherwise decode every block whose `ts` is strictly newer
+    ///    than `last_ts` (in oldest-first order, so a gap left by a dropped packet is filled
+    ///    before the primary), pushing PCM to `queue` and advancing `last_ts`. Blocks at or
+    ///    below `last_ts` are already-played duplicates and are skipped — the timestamp dedup
+    ///    that makes redundancy free of double-decoding under no loss.
     fn decode_red_into_queue(&mut self, payload: &[u8], primary_ts: i64, queue: &PlayQueue) {
         let n = payload.len();
         let mut i = 0usize;
@@ -714,7 +849,7 @@ impl OpusPlaybackDecoder {
         let mut nh = 0usize;
         while i < n && (payload[i] & 0x80) != 0 {
             if i + 4 > n || nh >= RED_MAX_DISTANCE as usize {
-                return; // malformed, or more redundancy than the contract allows
+                return;
             }
             let field = ((payload[i + 1] as u32) << 16)
                 | ((payload[i + 2] as u32) << 8)
@@ -727,9 +862,8 @@ impl OpusPlaybackDecoder {
         if i >= n {
             return;
         }
-        i += 1; // primary (F=0) header byte
+        i += 1;
 
-        // Block boundaries as (ts, start, len), oldest-first; the primary is the rest.
         let mut frames = [(0i64, 0usize, 0usize); RED_MAX_DISTANCE as usize + 1];
         let mut nf = 0usize;
         for k in 0..nh {
@@ -745,7 +879,6 @@ impl OpusPlaybackDecoder {
         frames[nf] = (primary_ts, i, n - i);
         nf += 1;
 
-        // First packet: anchor on the primary; don't replay its trailing redundancy.
         if self.last_ts.is_none() {
             let (ts, start, len) = frames[nf - 1];
             if len > 0 {
@@ -769,26 +902,34 @@ impl OpusPlaybackDecoder {
     }
 }
 
+/// @brief Per-`AudioPlayback` shared handle — the mirror of `Shared` for the playback path.
+///
+/// Reuses the capture lifecycle core on `Inner` (the `stop_state` protocol, the start
+/// handshake, and the worker-tid re-entrancy guard); the Opus/silence settings mirrors on
+/// `Inner` are unused here. Adds the bounded PCM `queue` and the always-Opus mic decoder.
 struct PbShared {
-    // Reuse the capture lifecycle core: stop_state protocol, start handshake, and
-    // the worker-thread tid guard. The opus/silence mirrors on Inner are unused here.
     inner: Arc<Inner>,
     thread: Mutex<Option<JoinHandle<()>>>,
     queue: Arc<PlayQueue>,
-    // Mic uplink is always Opus; write() decodes each packet through this before
-    // enqueuing PCM. Set at start(); None only before a successful start.
+    /// The mic uplink is always Opus; `write` / `write_red` decode each packet through this
+    /// before enqueuing PCM. Set at `start()`; `None` only before a successful start.
     opus_dec: Mutex<Option<OpusPlaybackDecoder>>,
 }
 
-// Registry of live playbacks, swept by the same atexit sweep as captures.
+/// @brief Process-wide registry of live playbacks, swept by the same atexit sweep as
+/// captures. Holds `Weak` references so it keeps nothing alive on its own.
 static PLAYBACK_REGISTRY: OnceLock<Mutex<Vec<Weak<PbShared>>>> = OnceLock::new();
+/// @brief Lazily initialize and return the playback registry.
 fn playback_registry() -> &'static Mutex<Vec<Weak<PbShared>>> {
     PLAYBACK_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-// ============================================================================
-// Capture thread.
-// ============================================================================
+/// @brief Run one bounded iteration of a PulseAudio standard mainloop:
+/// `prepare(timeout_us)` → `poll` → `dispatch`. Returns `false` if any stage errors.
+///
+/// The `timeout_us` bound is what makes a pending stop observable within ~20 ms even when
+/// the audio source delivers nothing, since every loop that calls this re-checks
+/// `stop_pending()` between pumps.
 fn pump(ml: &mut pulse::mainloop::standard::Mainloop, timeout_us: u64) -> bool {
     if ml.prepare(Some(MicroSeconds(timeout_us))).is_err() {
         return false;
@@ -802,9 +943,11 @@ fn pump(ml: &mut pulse::mainloop::standard::Mainloop, timeout_us: u64) -> bool {
     true
 }
 
-/// Chromium's multistream-Opus surround layouts: (streams, coupled, mapping).
-/// The same tables are advertised in the WebRTC SDP (`multiopus`), so the browser's
-/// decoder inverts exactly what this encoder applies.
+/// @brief Chromium's multistream-Opus surround layout for a channel count, as
+/// `(streams, coupled, mapping)`; `None` for anything but 5.1 (6) or 7.1 (8).
+///
+/// The same tables are advertised in the WebRTC SDP (`multiopus`), so the browser's decoder
+/// inverts exactly the stream/coupling/mapping this encoder applies.
 fn multiopus_layout(channels: i32) -> Option<(i32, i32, &'static [u8])> {
     match channels {
         6 => Some((4, 2, &[0, 4, 1, 2, 3, 5])),
@@ -813,18 +956,22 @@ fn multiopus_layout(channels: i32) -> Option<(i32, i32, &'static [u8])> {
     }
 }
 
-/// One encode surface over both Opus APIs: the `opus` crate for mono/stereo and the
-/// raw multistream API for 6/8-channel surround.
+/// @brief One encode surface over both Opus APIs: the `opus` crate for mono/stereo, and
+/// the raw multistream C API for 6/8-channel surround.
 enum PcmEncoder {
     Stereo(opus::Encoder),
     Multi(MultiOpus),
 }
 
+/// @brief Owning wrapper over a raw `OpusMSEncoder` (the surround multistream encoder).
+///
+/// The raw pointer is only ever touched from the capture thread that owns the enclosing
+/// `RunState`, which is what makes the `unsafe impl Send` below sound; `Drop` destroys the
+/// C encoder.
 struct MultiOpus {
     st: *mut audiopus_sys::OpusMSEncoder,
 }
 
-// The raw encoder is only ever touched from the capture thread that owns RunState.
 unsafe impl Send for MultiOpus {}
 
 impl Drop for MultiOpus {
@@ -834,6 +981,15 @@ impl Drop for MultiOpus {
 }
 
 impl PcmEncoder {
+    /// @brief Build the Opus encoder for a channel count, selecting the API by width.
+    ///
+    /// - **Mono/stereo** (`channels <= 2`): the safe `opus` crate encoder in `LowDelay`
+    ///   application mode; a failure to apply the initial bitrate or VBR mode is logged but
+    ///   not fatal.
+    /// - **Surround** (6/8): the raw multistream C encoder created from `multiopus_layout`
+    ///   in `RESTRICTED_LOWDELAY`; an unsupported channel count is a hard error.
+    ///
+    /// Bitrate and VBR are applied at creation and can be retuned live via `set_bitrate`.
     fn new(sample_rate: u32, channels: i32, vbr: bool, bitrate: i32) -> Result<Self, String> {
         if channels <= 2 {
             let ch = if channels == 1 { Channels::Mono } else { Channels::Stereo };
@@ -883,6 +1039,10 @@ impl PcmEncoder {
         }
     }
 
+    /// @brief Encode one interleaved-PCM frame into `out`, returning the packet byte length.
+    ///
+    /// Dispatches to the `opus` crate (mono/stereo) or the raw multistream encode (surround,
+    /// which needs the explicit `frame_size_per_channel`). Either error surfaces as a `String`.
     fn encode(
         &mut self,
         pcm: &[i16],
@@ -910,6 +1070,7 @@ impl PcmEncoder {
         }
     }
 
+    /// @brief Retune the encoder's target bitrate live (bits/s), for either API.
     fn set_bitrate(&mut self, bits: i32) -> Result<(), String> {
         match self {
             PcmEncoder::Stereo(enc) => enc
@@ -931,12 +1092,17 @@ impl PcmEncoder {
     }
 }
 
-/// Bounded drop-oldest hand-off from the capture thread to the Python delivery
-/// thread, so a slow or GIL-blocked callback can never stall the PulseAudio pump
-/// (parity with the pixelflux delivery-thread model). Stale audio is worthless, so
-/// overflow discards the OLDEST frame; capacity is a few frames of slack.
+/// @brief Backing store for the delivery ring: `Some(queue)` while open, `None` once closed
+/// so `pop` wakes and returns `None` for a clean shutdown.
 type FrameQueue = Option<VecDeque<(Vec<u8>, u64)>>;
 
+/// @brief Bounded, drop-oldest hand-off from the capture thread to the Python delivery
+/// thread, so a slow or GIL-blocked callback can never stall the PulseAudio pump.
+///
+/// The capture thread `push`es encoded `(frame, pts)` pairs; the delivery thread blocks in
+/// `pop`. Stale audio is worthless, so overflow past `capacity` (a few frames of slack)
+/// discards the OLDEST frame and bumps `dropped`. `close` empties the queue to `None` and
+/// wakes the consumer so it exits.
 struct DeliveryRing {
     q: Mutex<FrameQueue>,
     cv: Condvar,
@@ -945,6 +1111,7 @@ struct DeliveryRing {
 }
 
 impl DeliveryRing {
+    /// @brief Create an open ring pre-sized to `capacity` frames.
     fn new(capacity: usize) -> Self {
         Self {
             q: Mutex::new(Some(VecDeque::with_capacity(capacity))),
@@ -954,6 +1121,8 @@ impl DeliveryRing {
         }
     }
 
+    /// @brief Enqueue one encoded frame, dropping the oldest (and bumping `dropped`) if the
+    /// ring is at capacity, then wake the consumer. A no-op once closed.
     fn push(&self, data: Vec<u8>, pts: u64) {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(q) = g.as_mut() {
@@ -966,6 +1135,8 @@ impl DeliveryRing {
         }
     }
 
+    /// @brief Block until a frame is available and return it, or return `None` once the ring
+    /// is closed and drained — the delivery thread's loop condition.
     fn pop(&self) -> Option<(Vec<u8>, u64)> {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -981,33 +1152,39 @@ impl DeliveryRing {
         }
     }
 
+    /// @brief Close the ring: drop any queued frames and wake every waiter so `pop` returns
+    /// `None`. Called during capture teardown to join the delivery thread.
     fn close(&self) {
         *self.q.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.cv.notify_all();
     }
 }
 
-/// Recycles outgoing frame buffers from dropped AudioFrames back to the capture
-/// thread, so the steady-state emit path allocates nothing. INVARIANT: every buffer
-/// is born in `take` as `vec![0u8; buf_size]`, so bytes [0, buf_size) stay
-/// initialized for the allocation's lifetime (truncate only shortens `len`), which
-/// makes the `set_len` restore on reuse sound.
+/// @brief Recycles outgoing frame buffers from dropped `AudioFrame`s back to the capture
+/// thread, so the steady-state emit path allocates nothing.
+///
+/// INVARIANT: every buffer is born as `vec![0u8; buf_size]`, so bytes `[0, buf_size)` stay
+/// initialized for the allocation's whole lifetime — `truncate` only shortens `len`, never
+/// de-initializes memory. That is what makes `restore`'s `set_len` back to `buf_size` sound.
 struct BufferPool {
     bufs: Mutex<Vec<Vec<u8>>>,
     buf_size: usize,
 }
 
 impl BufferPool {
-    // Outstanding frames rarely exceed the delivery-ring capacity plus a few
-    // Python-held references; anything past this cap goes back to the allocator.
+    /// @brief Cap on pooled buffers. Outstanding frames rarely exceed the delivery-ring
+    /// capacity plus a few Python-held references; anything past this goes back to the
+    /// allocator rather than growing the pool unboundedly.
     const MAX_POOLED: usize = 16;
 
+    /// @brief Create an empty pool that hands out (and accepts) `buf_size`-byte buffers.
     fn new(buf_size: usize) -> Self {
         Self { bufs: Mutex::new(Vec::new()), buf_size }
     }
 
-    /// A fully initialized buffer of exactly `buf_size` length (the runtime path
-    /// takes through PoolTaker; this direct form serves the unit tests).
+    /// @brief Take a fully initialized buffer of exactly `buf_size` length, recycling a
+    /// pooled one when available. The runtime path takes through `PoolTaker`; this direct,
+    /// locking form serves the unit tests.
     #[cfg(test)]
     fn take(&self) -> Vec<u8> {
         let recycled = self.bufs.lock().unwrap_or_else(|e| e.into_inner()).pop();
@@ -1017,15 +1194,19 @@ impl BufferPool {
         }
     }
 
-    /// Restore a recycled buffer to full length.
+    /// @brief Restore a recycled buffer to full `buf_size` length via `set_len`.
+    ///
+    /// Sound per the pool invariant: the bytes were written at allocation and truncation
+    /// does not de-initialize them, so extending `len` back to `buf_size` never exposes
+    /// uninitialized memory.
     fn restore(&self, mut v: Vec<u8>) -> Vec<u8> {
         debug_assert!(v.capacity() >= self.buf_size);
-        // Sound per the pool invariant: the bytes were written at allocation and
-        // truncation does not de-initialize them.
         unsafe { v.set_len(self.buf_size) };
         v
     }
 
+    /// @brief Return a buffer to the pool, unless it is undersized or the pool is already at
+    /// `MAX_POOLED` (in which case it is dropped to the allocator).
     fn put(&self, v: Vec<u8>) {
         if v.capacity() < self.buf_size {
             return;
@@ -1036,27 +1217,32 @@ impl BufferPool {
         }
     }
 
-    /// Move every pooled buffer into `into` under a single lock (batched refill for
-    /// the sole-consumer PoolTaker; `into` is the taker's empty local stash).
+    /// @brief Move every pooled buffer into `into` under a single lock — the batched refill
+    /// for the sole-consumer `PoolTaker`, whose empty local stash is `into`.
     fn drain_into(&self, into: &mut Vec<Vec<u8>>) {
         let mut g = self.bufs.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::swap(&mut *g, into);
     }
 }
 
-/// Sole-consumer view over the shared pool for the capture thread: refills are
-/// batched, so the per-frame take is lock-free in the steady state while returns
-/// (AudioFrame drops on the delivery/Python side) still go through the pool.
+/// @brief Sole-consumer view over the shared `BufferPool` for the capture thread.
+///
+/// Refills are batched into a `local` stash, so the per-frame `take` is lock-free in the
+/// steady state, while returns from the delivery/Python side (`AudioFrame` drops) still go
+/// back through the shared pool. Only the capture thread owns a `PoolTaker`.
 struct PoolTaker {
     pool: Arc<BufferPool>,
     local: Vec<Vec<u8>>,
 }
 
 impl PoolTaker {
+    /// @brief Wrap a shared pool with an empty local stash.
     fn new(pool: Arc<BufferPool>) -> Self {
         Self { pool, local: Vec::new() }
     }
 
+    /// @brief Take one `buf_size` buffer: pop from the local stash, batch-refilling it from
+    /// the shared pool (one lock) only when empty, and allocating fresh when both are empty.
     fn take(&mut self) -> Vec<u8> {
         if self.local.is_empty() {
             self.pool.drain_into(&mut self.local);
@@ -1067,7 +1253,7 @@ impl PoolTaker {
         }
     }
 
-    /// Error-path return that never locks (stays in the local stash).
+    /// @brief Return a buffer on an error path without locking — it stays in the local stash.
     fn put(&mut self, v: Vec<u8>) {
         if v.capacity() >= self.pool.buf_size && self.local.len() < BufferPool::MAX_POOLED {
             self.local.push(v);
@@ -1075,30 +1261,33 @@ impl PoolTaker {
     }
 }
 
-// Per-run encode/deliver state living on the capture thread's stack.
+/// @brief Per-run encode/deliver state, living on the capture thread's stack for the
+/// lifetime of one capture. Holds the encoder, the frame-reassembly buffers, the outgoing
+/// buffer recycler, the RED redundancy history, and the running debug-log counters.
 struct RunState<'a> {
     inner: &'a Inner,
     ring: &'a DeliveryRing,
     encoder: PcmEncoder,
     frame_size_per_channel: usize,
     channels: usize,
-    // Reassembly buffer sized to one Opus frame (i16 samples; byte-filled).
+    /// Reassembly buffer for exactly one Opus frame (`i16` samples, filled byte-wise from
+    /// the incoming PulseAudio fragments).
     accum: Vec<i16>,
-    // Zeroed reference of the same length; slice equality against it lowers to a
-    // single vectorized memcmp for the silence gate (vs a scalar per-sample scan).
+    /// A zeroed reference of the same length as `accum`; comparing `accum == silence_ref`
+    /// lowers to a single vectorized memcmp for the silence gate, versus a scalar per-sample
+    /// scan.
     silence_ref: Vec<i16>,
     pcm_fill_bytes: usize,
-    // Outgoing-buffer recycler shared with delivered AudioFrames (their drop refills it).
+    /// Outgoing-buffer recycler, shared with delivered `AudioFrame`s whose drop refills it.
     pool: PoolTaker,
-    // RFC 2198 redundancy: the last `red_distance` emitted (opus, pts) frames, kept
-    // oldest-first. Per-run (reset on start; frame size is fixed for a run).
+    /// RFC 2198 redundancy history: the last `red_distance` emitted `(opus, pts)` frames,
+    /// oldest-first. Per-run — reset on start, and the frame size is fixed for a run.
     red_history: VecDeque<(Vec<u8>, u64)>,
     red_distance: usize,
     total_samples_processed: u64,
     first_sound_detected: bool,
     last_requested_bitrate: i32,
     current_applied_bitrate: i32,
-    // stats
     chunks_read: u64,
     chunks_silent: u64,
     chunks_encoded: u64,
@@ -1106,7 +1295,13 @@ struct RunState<'a> {
 }
 
 impl<'a> RunState<'a> {
-    // Feed one PulseAudio fragment; emit each complete frame as it fills.
+    /// @brief Feed one PulseAudio PCM fragment into the reassembly buffer, emitting a frame
+    /// each time `accum` fills to exactly one Opus frame.
+    ///
+    /// Fragments arrive at arbitrary byte boundaries, so this copies from `src` into `accum`
+    /// at `pcm_fill_bytes`, calling `emit_frame` (and resetting the fill cursor) whenever a
+    /// full `frame_size_per_channel * channels * 2`-byte chunk accumulates, and loops until
+    /// `src` is drained. Any partial remainder is carried into the next fragment.
     fn feed(&mut self, mut src: &[u8]) {
         let chunk_bytes = self.frame_size_per_channel * self.channels * 2;
         while !src.is_empty() {
@@ -1126,11 +1321,30 @@ impl<'a> RunState<'a> {
         }
     }
 
+    /// @brief Encode one reassembled frame and hand it to the delivery thread. The heart of
+    /// the capture encode path.
+    ///
+    /// 1. **Dynamic bitrate**: re-reads the `opus_bitrate` mirror and reconfigures the encoder
+    ///    only when it changed, so a live bitrate update costs nothing on unchanged frames.
+    /// 2. **Timestamp**: `pts` is the running 48 kHz-domain sample count
+    ///    (`total_samples_processed`) *before* this frame, then advanced by
+    ///    `frame_size_per_channel` — a monotonic per-frame timestamp used for RED offsets and
+    ///    client-side ordering.
+    /// 3. **Silence gate**: when enabled, a frame equal to the zeroed `silence_ref` is counted
+    ///    and dropped (nothing is sent), so pure silence costs no bandwidth. The first
+    ///    non-silent frame logs once.
+    /// 4. **Encode in place**: `write_ws_prefix_into` writes the RFC 2198 RED framing prefix
+    ///    (which depends only on `pts` + history) into a pooled buffer, and the Opus packet is
+    ///    encoded DIRECTLY after it — no assembly copy, and the buffer recycles through the
+    ///    pool, so the steady state allocates nothing. An encode error or a zero-length packet
+    ///    returns the buffer to the pool and drops the frame.
+    /// 5. **Retain redundancy**: with `red_distance > 0`, the just-encoded primary is pushed
+    ///    onto `red_history` (bounded, oldest-first) to serve as a future redundant copy.
+    /// 6. **Hand off**: the truncated buffer is pushed to the `DeliveryRing`; the capture
+    ///    thread itself never touches the GIL.
     fn emit_frame(&mut self) {
         self.chunks_read += 1;
 
-        // Apply the requested bitrate only when it changed, to avoid re-configuring
-        // the encoder on every frame.
         let requested = self.inner.opus_bitrate.load(Ordering::Relaxed);
         if requested != self.last_requested_bitrate {
             self.last_requested_bitrate = requested;
@@ -1164,11 +1378,6 @@ impl<'a> RunState<'a> {
         }
 
         let n = self.frame_size_per_channel * self.channels;
-        // Frame body: legacy [0x01,0x00]+opus when red_distance==0 (byte-identical),
-        // RFC 2198 RED framing when >0, or raw opus when the header is omitted. The
-        // prefix depends only on pts + history, so it is written first and the packet
-        // is encoded DIRECTLY into its final buffer — no assembly copy, and the
-        // buffer recycles through the pool (no steady-state allocation).
         let emit_header = self.inner.emit_audio_header.load(Ordering::Relaxed);
         let mut data = self.pool.take();
         let prefix = write_ws_prefix_into(
@@ -1196,7 +1405,6 @@ impl<'a> RunState<'a> {
             self.pool.put(data);
             return;
         }
-        // Retain the primary as future redundancy (bounded to red_distance, oldest-first).
         if self.red_distance > 0 {
             self.red_history
                 .push_back((data[prefix..prefix + encoded].to_vec(), pts));
@@ -1206,15 +1414,44 @@ impl<'a> RunState<'a> {
         }
         data.truncate(prefix + encoded);
 
-        // Hand off to the delivery thread; the capture thread never touches the GIL.
         self.ring.push(data, pts);
     }
 }
 
-// Drive the whole capture run. Sets start_state RUNNING on entering the hot loop,
-// FAILED on any startup error. Returns when stop_state leaves STOP_NONE or on fatal error.
+/// @brief Own one whole capture run end to end on a dedicated thread — connect PulseAudio,
+/// encode, and deliver — until stopped. It runs on its own thread because the PulseAudio
+/// mainloop must be pumped continuously and independently of Python: sharing the caller's
+/// thread would tie capture cadence to the GIL and let any Python stall starve the audio.
+/// The body handed to `spawn_worker`.
+///
+/// Publishes `start_state` for the handshake (`FAILED` on any startup error, `RUNNING` on
+/// entering the hot loop) and returns when `stop_state` leaves `STOP_NONE` or on a fatal
+/// error. The startup sequence, in order:
+///
+/// 1. **Seed the mirrors + validate**: copies the settings snapshot into the `Inner`
+///    per-frame atomics, and rejects an invalid Opus frame duration, channel count, or
+///    sample spec before touching PulseAudio.
+/// 2. **Buffer attr / latency**: a configured `latency_ms` uses `ADJUST_LATENCY` with
+///    `fragsize` set to that latency; otherwise `fragsize` is floored at ~20 ms, which yields
+///    a prompt first frame and avoids PipeWire's ~2 s default fragment.
+/// 3. **Connect + probe**: drives the context to `Ready` on the bounded pump (re-checking
+///    `stop_pending` each turn), and up-front validates a NAMED device via an introspect
+///    probe — an async `connect_record` would not fail synchronously on a bad name. The probe
+///    closure is called from C inside mainloop dispatch, so its body is `catch_unwind`-guarded
+///    to keep a panic from unwinding across the FFI boundary.
+/// 4. **Encoder + record stream**: creates the `PcmEncoder` (mono/stereo or surround) and
+///    drives the record stream to `Ready`.
+/// 5. **Delivery thread**: spawns the delivery thread that pops from the `DeliveryRing` and
+///    runs the Python callback there, so GIL stalls cannot back up the PA pump; a callback
+///    error is reported as an unraisable exception and never propagates into the loop. The
+///    buffer pool is sized to the worst-case body — RED prefix plus a max Opus packet, scaled
+///    by stream count for surround (one self-delimited packet per stream).
+/// 6. **Hot loop**: `pump`s on the ~20 ms bound, then drains every buffered fragment via
+///    peek/discard (a `Hole` is an xrun — the read index is just advanced), feeding each into
+///    `RunState`. A stop is observed within the pump bound even when the source is wedged. On
+///    exit it disconnects the stream, drops the encoder, closes and joins the delivery ring,
+///    and reports any dropped stale frames.
 fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
-    // Seed lock-free mirrors from the snapshot.
     inner.opus_bitrate.store(settings.opus_bitrate, Ordering::Relaxed);
     inner.use_silence_gate.store(settings.use_silence_gate, Ordering::Relaxed);
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
@@ -1253,8 +1490,6 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
         return;
     }
 
-    // Buffer attr: configured latency -> ADJUST_LATENCY + fragsize=latency; default
-    // -> fragsize floored at ~20ms (prompt first frame; avoids PipeWire's ~2s default).
     let mut attr = BufferAttr {
         maxlength: u32::MAX,
         tlength: u32::MAX,
@@ -1303,7 +1538,6 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
         return;
     }
 
-    // Drive context -> Ready (honoring stop_state + the bounded pump).
     loop {
         let st = context.get_state();
         if st == pulse::context::State::Ready {
@@ -1327,13 +1561,10 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
     }
     plog!("[pcmflux] SUCCESS: Connected to PulseAudio.");
 
-    // Validate a NAMED device up front (async connect_record won't fail synchronously).
     if let Some(dev) = device {
-        let probe = Arc::new(Mutex::new((false, false))); // (found, done)
+        let probe = Arc::new(Mutex::new((false, false)));
         let p2 = probe.clone();
         let op = context.introspect().get_source_info_by_name(dev, move |res| {
-            // This closure is invoked by libpulse from C (inside mainloop dispatch);
-            // a panic must not unwind across that FFI boundary, so contain it here.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut g = p2.lock().unwrap();
                 match res {
@@ -1373,7 +1604,6 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
         }
     }
 
-    // Opus encoder (mono/stereo, or multistream surround for 6/8 channels).
     let encoder = match PcmEncoder::new(
         settings.sample_rate,
         settings.channels,
@@ -1415,7 +1645,6 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
         return;
     }
 
-    // Drive stream -> Ready.
     loop {
         let st = stream.get_state();
         if st == pulse::stream::State::Ready {
@@ -1452,11 +1681,7 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
         if settings.use_silence_gate { "On" } else { "Off" }
     );
 
-    // Delivery thread: consumes encoded frames from a bounded drop-oldest ring and
-    // runs the Python callback there, so GIL stalls can't back up the PA pump.
     let ring = Arc::new(DeliveryRing::new(8));
-    // One buffer holds the worst-case body: RED prefix + a max-size packet (surround
-    // multistream is one self-delimited packet per stream, so scale with streams).
     let max_pkt = if settings.channels > 2 { 4 * MAX_OPUS_PACKET } else { MAX_OPUS_PACKET };
     let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + max_pkt));
     let deliver_ring = Arc::clone(&ring);
@@ -1482,8 +1707,6 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
                         }
                     };
                     if let Err(e) = deliver_cb.call1(py, (frame,)) {
-                        // Report as an unraisable exception; never propagate a callback
-                        // error into the delivery loop (it must keep running).
                         e.write_unraisable(py, Some(deliver_cb.bind(py)));
                     }
                 });
@@ -1523,9 +1746,6 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
 
     let mut last_log = Instant::now();
 
-    // Hot loop: bounded pump, then drain all available fragments (no read callback;
-    // polling via peek/discard keeps the borrow model simple and still drains every
-    // <=20ms). A stop is observed within the pump bound even when wedged.
     while !inner.stop_pending() {
         if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
             elog!("[pcmflux] ERROR: mainloop iterate failed; stopping capture.");
@@ -1539,13 +1759,12 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
             break;
         }
 
-        // Drain every fragment currently buffered.
         loop {
             let mut discard = false;
             let mut done = false;
             match stream.peek() {
                 Ok(PeekResult::Empty) => done = true,
-                Ok(PeekResult::Hole(_)) => discard = true, // xrun: advance read index
+                Ok(PeekResult::Hole(_)) => discard = true,
                 Ok(PeekResult::Data(buf)) => {
                     run.feed(buf);
                     discard = true;
@@ -1589,7 +1808,7 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
     plog!("[pcmflux] Stop requested. Cleaning up capture loop...");
     inner.started_ok.store(false, Ordering::Release);
     let _ = stream.disconnect();
-    drop(run); // encoder
+    drop(run);
     ring.close();
     if let Some(j) = deliver_join {
         let _ = j.join();
@@ -1604,12 +1823,28 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
     plog!("[pcmflux] Audio capture loop finished. Resources released.");
 }
 
-// ============================================================================
-// Playback thread. Owns the PA playback stream; the only thread that touches it,
-// so writes are serialized structurally (no executor). Mirrors capture_run's
-// startup + bounded-pump lifecycle. Sets start_state RUNNING on entering the hot
-// loop, FAILED on any startup error.
-// ============================================================================
+/// @brief Drive one whole mic-playback run on the playback thread. The body handed to
+/// `spawn_worker`; the mirror of `capture_run` for the uplink.
+///
+/// This thread solely owns the PA playback stream, so writes are serialized structurally
+/// with no executor. It mirrors `capture_run`'s startup + bounded-pump lifecycle:
+/// `start_state` goes `RUNNING` on entering the hot loop and `FAILED` on any startup error,
+/// and it returns when `stop_state` leaves `STOP_NONE` or on a fatal error.
+///
+/// **Buffer sizing and the prebuf timing rule** (load-bearing): `tlength` is the target
+/// latency in bytes, and `prebuf` is a quarter of it, floored to one frame. `prebuf` must
+/// NOT be zero: with `prebuf == 0` PulseAudio starts playback instantly, the realtime read
+/// pointer then runs ahead of the write index, and every `SeekMode::Relative` write lands
+/// "in the past" — the server silently discards it forever (observed as bytes flowing at
+/// exactly realtime rate while the sink monitor stayed silent). A quarter-buffer prebuf makes
+/// the stream wait for data before starting and re-prebuffer after each underrun, so a late
+/// chunk plays slightly delayed instead of vanishing.
+///
+/// **Hot loop**: `pump`s on the ~20 ms bound, then, whenever the server is writable, drains
+/// that many bytes from the `PlayQueue` (clamped and frame-aligned) and writes them with
+/// `free_cb = None`, so PA copies the bytes and the `scratch` buffer is reused next
+/// iteration. Newly queued bytes are picked up on the next pump — no cross-thread wakeup is
+/// needed, mirroring capture's poll style — and a stop is observed within the pump bound.
 fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
 
@@ -1663,7 +1898,6 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         return;
     }
 
-    // Drive context -> Ready (honoring stop_state + the bounded pump).
     loop {
         let st = context.get_state();
         if st == pulse::context::State::Ready {
@@ -1687,12 +1921,6 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     }
     plog!("[pcmflux] SUCCESS: Connected to PulseAudio (playback).");
 
-    // tlength = target latency. prebuf must NOT be 0: with prebuf=0 playback starts
-    // instantly and the realtime read pointer runs ahead of the write index, so every
-    // Relative write lands "in the past" and the server silently discards it forever
-    // (verified: bytes flowed at exactly realtime rate while the sink monitor stayed
-    // silent). A quarter-buffer prebuf makes the stream wait for data and re-prebuffer
-    // after underruns, so late chunks play (slightly delayed) instead of vanishing.
     let tlength =
         spec.usec_to_bytes(MicroSeconds(settings.latency_ms.max(0) as u64 * 1000)) as u32;
     let attr = BufferAttr {
@@ -1723,7 +1951,6 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         return;
     }
 
-    // Drive stream -> Ready.
     loop {
         let st = stream.get_state();
         if st == pulse::stream::State::Ready {
@@ -1760,9 +1987,6 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     inner.started_ok.store(true, Ordering::Release);
     inner.start_state.store(ST_RUNNING, Ordering::Release);
 
-    // Hot loop: bounded pump, then write as much queued PCM as the server will take.
-    // A stop is observed within the pump bound; newly queued bytes are picked up on
-    // the next pump (no cross-thread wakeup needed, mirroring capture's poll style).
     let mut scratch: Vec<u8> = Vec::new();
     let mut bytes_written: u64 = 0;
     let mut writable_hits: u64 = 0;
@@ -1781,9 +2005,8 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         if let Some(can) = stream.writable_size() {
             if can > 0 {
                 writable_hits += 1;
-                queue.drain_upto(can, &mut scratch); // clamped to writable, frame-aligned
+                queue.drain_upto(can, &mut scratch);
                 if !scratch.is_empty() {
-                    // free_cb=None => PA copies; scratch is reused next iteration.
                     if let Err(e) = stream.write(&scratch, None, 0, pulse::stream::SeekMode::Relative)
                     {
                         elog!("[pcmflux] ERROR: pa_stream_write() failed: {e:?}");
@@ -1811,9 +2034,8 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     plog!("[pcmflux] Audio playback loop finished. Resources released.");
 }
 
-// ============================================================================
-// AudioCapture pyclass.
-// ============================================================================
+/// @brief Python-facing capture handle. Owns the `Shared` lifecycle state and exposes
+/// `start_capture` / `stop_capture` / `update_audio_bitrate` / `is_capturing` to Python.
 #[pyclass]
 struct AudioCapture {
     shared: Arc<Shared>,
@@ -1837,6 +2059,23 @@ impl AudioCapture {
         }
     }
 
+    /// @brief Start (or restart) audio capture, delivering encoded frames to `callback`.
+    ///
+    /// 1. **Re-entrancy guard**: if called on the capture thread itself (the callback called
+    ///    `start`), it cannot join/recreate itself, so it just undoes a nested SELF-stop and
+    ///    returns. That undo is a compare-exchange that clears the stop ONLY if this thread
+    ///    still owns it — if an external stop stored `STOP_EXTERNAL` meanwhile, the CAS fails
+    ///    and that stop stands (clearing it would strand its in-flight join forever).
+    /// 2. **Spawn with the GIL released**: `spawn_worker` stops/joins any prior thread and
+    ///    spawns the new one via `py.detach`, because the lifecycle lock and `join()` must not
+    ///    be held while holding the GIL — the capture thread's last callback needs the GIL, so
+    ///    that would deadlock. The stop/clear ordering (the lost-stop invariant) lives in
+    ///    `spawn_worker`.
+    /// 3. **Register** the handle for the atexit sweep (best-effort), pruning dead weaks.
+    /// 4. **Startup handshake**: waits up to ~2 s (GIL released) for the thread to publish
+    ///    `RUNNING` or `FAILED`. On `FAILED`, `join_failed_start` tears down ONLY the thread
+    ///    this call spawned (identity-checked) — a concurrent start may already own the slot
+    ///    with a live run that must survive — and the error is surfaced to Python.
     fn start_capture(
         &self,
         py: Python<'_>,
@@ -1845,11 +2084,6 @@ impl AudioCapture {
     ) -> PyResult<()> {
         let inner = self.inner().clone();
 
-        // Re-entrant start from the capture thread (callback called start): can't
-        // join/recreate ourselves -- just undo a nested SELF-stop and return. The CAS
-        // clears the stop ONLY if this same thread still owns it; if an external stop
-        // stored STOP_EXTERNAL in the meantime the CAS fails and that stop stands, or
-        // its mid-flight join would hang forever.
         let me = gettid();
         if inner.capture_tid.load(Ordering::Acquire) == me {
             inner.undo_self_stop(me);
@@ -1858,10 +2092,6 @@ impl AudioCapture {
 
         let parsed = extract_settings(settings)?;
 
-        // Stop any prior thread + spawn the new one with the GIL RELEASED. The
-        // lifecycle lock + join must not be held while holding the GIL (the capture
-        // thread's last callback needs the GIL); the stop/clear ordering lives in
-        // spawn_worker (the lost-stop invariant).
         let shared = &self.shared;
         let inner_ref = &inner;
         let t_inner = inner.clone();
@@ -1877,13 +2107,11 @@ impl AudioCapture {
             }
         };
 
-        // Register for the atexit sweep (best-effort).
         if let Ok(mut reg) = registry().lock() {
             reg.retain(|w| w.strong_count() > 0);
             reg.push(Arc::downgrade(&self.shared));
         }
 
-        // Startup handshake: wait <=~2s for the thread to publish RUNNING/FAILED.
         let mut state = inner.start_state.load(Ordering::Acquire);
         if state == ST_STARTING {
             py.detach(|| {
@@ -1897,9 +2125,6 @@ impl AudioCapture {
             });
         }
         if state == ST_FAILED {
-            // Join the failed thread (GIL released), then surface the error. Only
-            // the thread THIS call spawned is torn down; a concurrent start may
-            // already own the slot with a live run that must survive.
             let shared2 = &self.shared;
             let inner2 = &inner;
             py.detach(move || join_failed_start(&shared2.thread, inner2, my_thread));
@@ -1910,26 +2135,26 @@ impl AudioCapture {
         Ok(())
     }
 
+    /// @brief Stop audio capture, joining the capture thread.
+    ///
+    /// A re-entrant stop from the capture thread itself (the callback called `stop`) only
+    /// records a self-stop — it cannot self-join — and must not clobber an external stop
+    /// already in effect, which has to win the join. Otherwise it takes the lifecycle lock
+    /// and joins with the GIL released (via `py.detach`): the capture thread's last callback
+    /// needs the GIL, so holding it while blocking on the lock or in `join()` would deadlock.
+    /// The authoritative external stop is set INSIDE the lock immediately before the join, so
+    /// it wins over any concurrent self-stop.
     fn stop_capture(&self, py: Python<'_>) {
         let inner = self.inner();
-        // Re-entrant stop from the capture thread itself: record a self-stop (our own
-        // tid), do NOT join (can't self-join; would deadlock another thread joining us).
-        // Don't clobber an external stop already in effect -- it must win the join.
         let me = gettid();
         if inner.capture_tid.load(Ordering::Acquire) == me {
             inner.request_self_stop(me);
             return;
         }
-        // Take the lifecycle lock AND join with the GIL released: the capture thread's
-        // last callback needs the GIL, so we must not hold it while blocking on the
-        // lock or in join() (else: us holding GIL + blocked on lock, the lock-holder
-        // joining a thread that wants the GIL -> deadlock).
         let shared = &self.shared;
         py.detach(|| {
             let mut guard = shared.thread.lock().unwrap();
             if let Some(handle) = guard.take() {
-                // Authoritative external stop, INSIDE the lock before join; it must
-                // win over any concurrent self-stop.
                 inner.request_external_stop();
                 let _ = handle.join();
                 inner.capture_tid.store(0, Ordering::Release);
@@ -1937,11 +2162,13 @@ impl AudioCapture {
         });
     }
 
+    /// @brief Set the live Opus target bitrate (bits/s) via the atomic mirror; the capture
+    /// loop applies it on the next frame, without a restart.
     fn update_audio_bitrate(&self, bps: i32) {
-        // Atomic mirror; the capture loop applies it on the next frame.
         self.inner().opus_bitrate.store(bps, Ordering::Relaxed);
     }
 
+    /// @brief True while a capture worker is running with no stop pending.
     #[getter]
     fn is_capturing(&self) -> bool {
         let inner = self.inner();
@@ -1950,13 +2177,13 @@ impl AudioCapture {
 }
 
 impl Drop for AudioCapture {
+    /// @brief Best-effort stop on GC/dealloc: the re-entrant case records a self-stop only
+    /// (never clobbering a pending external stop); otherwise it takes the lifecycle lock and
+    /// joins the capture thread with the GIL released, matching `stop_capture`.
     fn drop(&mut self) {
-        // Best-effort stop on GC/dealloc. If we ARE the capture thread (re-entrant),
-        // don't join; otherwise take the lifecycle lock + join with the GIL released.
         let inner = &self.shared.inner;
         let me = gettid();
         if inner.capture_tid.load(Ordering::Acquire) == me {
-            // Self-stop only if still running; never clobber a pending external stop.
             inner.request_self_stop(me);
             return;
         }
@@ -1975,12 +2202,12 @@ impl Drop for AudioCapture {
     }
 }
 
-// ============================================================================
-// AudioPlayback pyclass. Symmetric to AudioCapture: same lifecycle protocol, a
-// playback stream instead of a record stream, and a bounded drop-oldest queue
-// (write) instead of a Python callback. Since Python never holds the PA handle,
-// the close-vs-inflight-write UAF the pasimple path guards is structurally gone.
-// ============================================================================
+/// @brief Python-facing mic-playback handle, symmetric to `AudioCapture`.
+///
+/// Same lifecycle protocol, but a PA playback stream instead of a record stream, and a
+/// bounded drop-oldest queue fed by `write` / `write_red` instead of a Python callback.
+/// Python never holds the PA handle — only the playback thread touches it — so a
+/// close-versus-inflight-write use-after-free is structurally impossible here.
 #[pyclass]
 struct AudioPlayback {
     shared: Arc<PbShared>,
@@ -2006,10 +2233,20 @@ impl AudioPlayback {
         }
     }
 
+    /// @brief Start (or restart) mic playback into the virtual sink. The playback mirror of
+    /// `start_capture`.
+    ///
+    /// Same shape as capture: a re-entrant start from the playback thread just undoes a
+    /// nested self-stop; the worker is spawned with the GIL released (the stop/clear ordering
+    /// lives in `spawn_worker`); the handle is registered for the atexit sweep; and a ~2 s
+    /// startup handshake surfaces a `FAILED` start after tearing down only the thread THIS
+    /// call spawned (identity-checked, sparing a concurrent winner). Before spawning, it
+    /// applies this run's byte bound + frame alignment to the queue (dropping any stale
+    /// audio) and creates the Opus decoder up front, since the mic uplink is always Opus and
+    /// `write` / `write_red` decode packets to PCM off the GIL for this same run.
     fn start(&self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
         let inner = self.inner().clone();
 
-        // Re-entrant start from the playback thread: just undo a nested self-stop.
         let me = gettid();
         if inner.capture_tid.load(Ordering::Acquire) == me {
             inner.undo_self_stop(me);
@@ -2017,12 +2254,9 @@ impl AudioPlayback {
         }
 
         let parsed = extract_pb_settings(settings)?;
-        // Bytes bound + frame alignment for this run (drops any stale audio).
         let frame_bytes = (parsed.channels.max(1) as usize) * 2;
         self.shared.queue.configure(parsed.max_buffer_bytes, frame_bytes);
 
-        // Mic uplink is always Opus (both transports): create the decoder up front so
-        // write() decodes packets to PCM (GIL released) for the same playback loop.
         let decoder = OpusPlaybackDecoder::new(parsed.sample_rate, parsed.channels);
         if decoder.is_none() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -2031,8 +2265,6 @@ impl AudioPlayback {
         }
         *self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner()) = decoder;
 
-        // Stop any prior thread + spawn the new one with the GIL RELEASED; the
-        // stop/clear ordering lives in spawn_worker (the lost-stop invariant).
         let shared = &self.shared;
         let inner_ref = &inner;
         let queue = self.shared.queue.clone();
@@ -2049,13 +2281,11 @@ impl AudioPlayback {
             }
         };
 
-        // Register for the atexit sweep (best-effort).
         if let Ok(mut reg) = playback_registry().lock() {
             reg.retain(|w| w.strong_count() > 0);
             reg.push(Arc::downgrade(&self.shared));
         }
 
-        // Startup handshake: wait <=~2s for the thread to publish RUNNING/FAILED.
         let mut state = inner.start_state.load(Ordering::Acquire);
         if state == ST_STARTING {
             py.detach(|| {
@@ -2069,8 +2299,6 @@ impl AudioPlayback {
             });
         }
         if state == ST_FAILED {
-            // Tear down only the thread THIS call spawned; a concurrent start may
-            // already own the slot with a live run that must survive.
             let shared2 = &self.shared;
             let inner2 = &inner;
             py.detach(move || join_failed_start(&shared2.thread, inner2, my_thread));
@@ -2081,11 +2309,15 @@ impl AudioPlayback {
         Ok(())
     }
 
-    // Hot path: one copy into the bounded queue with the GIL released; never blocks
-    // on PA, returns immediately. Drop-oldest happens inside push. Raises once no
-    // playback thread services the queue (start failure, stop, or a mid-run PA
-    // death) so the caller's reopen-on-error path engages instead of the audio
-    // being swallowed silently.
+    /// @brief Push one Opus mic packet for playback. The steady-state hot path.
+    ///
+    /// Gated on `worker_alive`: it raises once no playback thread services the queue (start
+    /// failure, stop, or a mid-run PA death), so the caller's reopen-on-error path engages
+    /// instead of the audio being swallowed silently. Otherwise it decodes the packet to PCM
+    /// and enqueues it with the GIL released — the decode touches no Python state, so dropping
+    /// the GIL lets it run concurrently with the rest of the app — and a bad packet is dropped
+    /// rather than corrupting the stream. It never blocks on PA (drop-oldest happens inside
+    /// `PlayQueue::push`).
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         if !self.inner().worker_alive() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -2094,8 +2326,6 @@ impl AudioPlayback {
         }
         let b = data.as_bytes();
         py.detach(|| {
-            // Opus uplink only: decode one packet to PCM and enqueue that; a bad packet is
-            // dropped rather than corrupting the stream.
             let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(d) = dec.as_mut() {
                 if let Some(pcm) = d.decode_to_pcm(b) {
@@ -2106,9 +2336,13 @@ impl AudioPlayback {
         Ok(())
     }
 
-    // Like write(), but the payload is an RFC 2198 RED frame (mic uplink over WebRTC/UDP):
-    // de-frame + loss-recover + decode entirely off the GIL. `primary_ts` is the packet's
-    // (monotonic) RTP timestamp; the redundant blocks carry offsets back from it.
+    /// @brief Play one RFC 2198 RED mic frame from the WebRTC/UDP uplink, recovering across any
+    /// packet loss on the way in. The lossy-transport counterpart of `write`.
+    ///
+    /// The payload is de-framed, loss-recovered, and decoded entirely off the GIL by
+    /// `decode_red_into_queue` (see there for why RED exists and why the decode runs off the
+    /// GIL). `primary_ts` is the packet's monotonic RTP timestamp; the redundant blocks carry
+    /// offsets back from it. Gated on `worker_alive` exactly like `write`.
     fn write_red(&self, py: Python<'_>, data: &Bound<'_, PyBytes>, primary_ts: i64) -> PyResult<()> {
         if !self.inner().worker_alive() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -2125,17 +2359,19 @@ impl AudioPlayback {
         Ok(())
     }
 
+    /// @brief Stop mic playback, joining the playback thread.
+    ///
+    /// A re-entrant stop from the playback thread records a self-stop only (it cannot
+    /// self-join) and never clobbers an external stop already in effect. Otherwise it joins
+    /// with the GIL released so a slow PA disconnect cannot stall the interpreter; `stop`
+    /// returns only once the thread is joined and the sink is released.
     fn stop(&self, py: Python<'_>) {
         let inner = self.inner();
-        // Re-entrant stop from the playback thread itself: record a self-stop, don't
-        // join (can't self-join). Don't clobber an external stop already in effect.
         let me = gettid();
         if inner.capture_tid.load(Ordering::Acquire) == me {
             inner.request_self_stop(me);
             return;
         }
-        // Join with the GIL released so a slow PA disconnect can't stall the
-        // interpreter; stop() returns only once the thread is joined (sink released).
         let shared = &self.shared;
         py.detach(|| {
             let mut guard = shared.thread.lock().unwrap();
@@ -2147,6 +2383,7 @@ impl AudioPlayback {
         });
     }
 
+    /// @brief True while a playback worker is running with no stop pending.
     #[getter]
     fn is_running(&self) -> bool {
         let inner = self.inner();
@@ -2155,8 +2392,8 @@ impl AudioPlayback {
 }
 
 impl Drop for AudioPlayback {
+    /// @brief Best-effort stop on GC/dealloc; symmetric to `AudioCapture::drop`.
     fn drop(&mut self) {
-        // Best-effort stop on GC/dealloc; symmetric to AudioCapture::drop.
         let inner = &self.shared.inner;
         let me = gettid();
         if inner.capture_tid.load(Ordering::Acquire) == me {
@@ -2178,9 +2415,13 @@ impl Drop for AudioPlayback {
     }
 }
 
-// ============================================================================
-// atexit sweep: stop every live capture + playback before interpreter shutdown.
-// ============================================================================
+/// @brief atexit sweep: stop and join every live capture and playback before interpreter
+/// shutdown, so no worker thread is still calling into Python during finalization.
+///
+/// Snapshots the two `Weak` registries into strong references (skipping any already
+/// dropped), then for each takes the lifecycle lock, sets the external stop before joining,
+/// and clears the tid — all with the GIL released. Registered on `atexit` from the module
+/// init.
 #[pyfunction]
 fn _stop_all_captures(py: Python<'_>) {
     let snapshot: Vec<Arc<Shared>> = match registry().lock() {
@@ -2219,13 +2460,13 @@ fn _stop_all_captures(py: Python<'_>) {
 mod tests {
     use super::*;
 
+    /// @brief Encode 5.1 with a tone only on FC (input channel 2), decode with the same
+    /// layout, and verify the energy comes back on that same channel — proving the
+    /// `multiopus_layout` tables are self-consistent end to end.
     #[test]
     fn multiopus_surround_roundtrip() {
-        // Encode 5.1 with a tone only on FC (input channel 2); decode with the same
-        // layout and verify the energy lands on the same channel — proving the
-        // layout tables are self-consistent end to end.
         let channels = 6usize;
-        let frame = 480usize; // 10 ms at 48 kHz
+        let frame = 480usize;
         let mut enc = PcmEncoder::new(48000, channels as i32, true, 256000).expect("encoder");
         let mut pcm = vec![0i16; frame * channels];
         for i in 0..frame {
@@ -2234,7 +2475,6 @@ mod tests {
             pcm[i * channels + 2] = v;
         }
         let mut out = vec![0u8; 4 * MAX_OPUS_PACKET];
-        // A couple of frames so the codec state settles.
         let mut n = 0;
         for _ in 0..3 {
             n = enc.encode(&pcm, frame, &mut out).expect("encode");
@@ -2281,6 +2521,8 @@ mod tests {
         }
     }
 
+    /// @brief `valid_opus_duration` accepts exactly the six legal Opus frame durations and
+    /// rejects everything else (including the near-misses 3, 15, 25, 30 ms).
     #[test]
     fn opus_durations() {
         for ms in [2.5, 5.0, 10.0, 20.0, 40.0, 60.0] {
@@ -2291,20 +2533,21 @@ mod tests {
         }
     }
 
+    /// @brief The samples-per-channel and PCM-byte arithmetic matches the wire cases:
+    /// 48 kHz / 20 ms / stereo is 960 samples/ch and 3840 bytes, and 24 kHz / 10 ms / mono
+    /// is 240 samples and 480 bytes.
     #[test]
     fn frame_geometry() {
-        // 48 kHz, 20 ms, stereo: 960 samples/ch, 3840 PCM bytes.
         let fspc = (48000usize * 20) / 1000;
         assert_eq!(fspc, 960);
         assert_eq!(fspc * 2 * 2, 3840);
-        // mono 10 ms @ 24 kHz
         let m = (24000usize * 10) / 1000;
         assert_eq!(m, 240);
         assert_eq!(m * 2, 480);
     }
 
-    // red_distance == 0 must be byte-identical to the legacy [0x01,0x00]+opus frame,
-    // and the omit-header path must return the raw opus with no prefix (unchanged).
+    /// @brief `red_distance == 0` produces exactly the 2-byte `[0x01, 0x00]` + opus framing,
+    /// and the omit-header path returns the raw opus with no prefix at all.
     #[test]
     fn red_zero_is_byte_identical_legacy() {
         let opus = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42];
@@ -2316,27 +2559,25 @@ mod tests {
             v
         };
         assert_eq!(build_ws_body(&opus, 4096, &hist, 0, true), legacy_expected);
-        // Header omitted: raw opus, no [0x01,n] prefix (pre-RED behavior).
         assert_eq!(build_ws_body(&opus, 4096, &hist, 0, false), opus);
     }
 
-    // red_distance == 2: parse the emitted body back (n_red 4-byte headers, 1-byte
-    // primary header, split datas by their lengths) and assert the primary and the two
-    // redundant blocks round-trip with the expected oldest-first offsets 1920 & 960.
+    /// @brief `red_distance == 2`: parse the emitted body back (`n_red` 4-byte headers, the
+    /// 1-byte primary header, block datas split by their lengths) and assert the primary and
+    /// the two redundant blocks round-trip with the expected oldest-first offsets 1920 & 960.
     #[test]
     fn red_two_roundtrips() {
-        let f_n2 = vec![0xA0, 0xA1, 0xA2]; // frame N-2, pts 0
-        let f_n1 = vec![0xB0, 0xB1, 0xB2, 0xB3]; // frame N-1, pts 960
-        let primary = vec![0xC0, 0xC1]; // frame N, pts 1920
+        let f_n2 = vec![0xA0, 0xA1, 0xA2];
+        let f_n1 = vec![0xB0, 0xB1, 0xB2, 0xB3];
+        let primary = vec![0xC0, 0xC1];
         let mut hist: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
-        hist.push_back((f_n2.clone(), 0)); // front = oldest
+        hist.push_back((f_n2.clone(), 0));
         hist.push_back((f_n1.clone(), 960));
 
         let body = build_ws_body(&primary, 1920, &hist, 2, true);
         assert_eq!(body[0], 0x01);
         let n_red = body[1] as usize;
         assert_eq!(n_red, 2);
-        // Primary pts (low 32 bits, big-endian) precedes the redundant headers.
         assert_eq!(u32::from_be_bytes([body[2], body[3], body[4], body[5]]), 1920);
 
         let mut idx = 6;
@@ -2354,7 +2595,6 @@ mod tests {
         assert_eq!(body[idx] & 0x80, 0x00, "primary header F bit must be clear");
         idx += 1;
 
-        // Oldest-first: block 0 is N-2 (offset 1920), block 1 is N-1 (offset 960).
         assert_eq!(offsets, vec![1920, 960]);
         assert_eq!(lens, vec![f_n2.len(), f_n1.len()]);
 
@@ -2368,19 +2608,20 @@ mod tests {
         assert_eq!(prim, &primary[..]);
     }
 
-    // Build an RFC 2198 RED payload: redundant blocks (oldest-first, each with a 14-bit
-    // timestamp offset back from the primary) then the primary. Mirrors the wire format
-    // decode_red_into_queue parses (the mic-uplink counterpart of build_ws_body).
+    /// @brief Test helper: build an RFC 2198 RED payload — redundant blocks oldest-first,
+    /// each with a 14-bit timestamp offset back from the primary, then the primary. Mirrors
+    /// the wire format `decode_red_into_queue` parses (the mic-uplink counterpart of
+    /// `build_ws_body`).
     fn build_red_payload(reds: &[(u64, &[u8])], primary: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         for (off, blk) in reds {
             let field = (((*off as u32) & 0x3FFF) << 10) | ((blk.len() as u32) & 0x3FF);
-            v.push(0x80 | (RED_BLOCK_PT & 0x7F)); // F=1: another block follows
+            v.push(0x80 | (RED_BLOCK_PT & 0x7F));
             v.push((field >> 16) as u8);
             v.push((field >> 8) as u8);
             v.push(field as u8);
         }
-        v.push(RED_BLOCK_PT & 0x7F); // primary header, F=0
+        v.push(RED_BLOCK_PT & 0x7F);
         for (_, blk) in reds {
             v.extend_from_slice(blk);
         }
@@ -2388,7 +2629,8 @@ mod tests {
         v
     }
 
-    // `n` distinct valid 20 ms mono Opus packets at 24 kHz (480 samples/frame).
+    /// @brief Test helper: `n` distinct valid 20 ms mono Opus packets at 24 kHz
+    /// (480 samples/frame).
     fn opus_frames(n: usize) -> Vec<Vec<u8>> {
         let mut enc = opus::Encoder::new(24000, Channels::Mono, Application::LowDelay).unwrap();
         (0..n)
@@ -2404,36 +2646,34 @@ mod tests {
             .collect()
     }
 
-    // Each decoded 20 ms mono frame is 480 samples * 2 bytes.
+    /// @brief Test constant: each decoded 20 ms mono frame is 480 samples * 2 bytes.
     const FRAME_PCM_BYTES: usize = 480 * 2;
 
-    // A dropped middle packet is recovered from the next packet's redundancy: the redundant
-    // copy of the gap frame is decoded, while the redundant copy of an already-played frame
-    // is not (dedup by timestamp). This is the off-GIL RED path that replaced the Python
-    // de-framer in rtc.py.
+    /// @brief A dropped middle packet is recovered from the next packet's redundancy: the
+    /// redundant copy of the gap frame is decoded, while the redundant copy of an
+    /// already-played frame is not (timestamp dedup). Exercises the off-GIL RED playback path
+    /// end to end — anchor on packet 1 (ts 1000), drop packet 2 (ts 1480), then packet 3
+    /// (ts 1960) carries redundant copies of 1000 and 1480, so the output is exactly the
+    /// three frames 1000 + 1480 + 1960.
     #[test]
     fn red_playback_recovers_lost_frame() {
-        let f = opus_frames(3); // ts 1000, 1480, 1960 (480-sample steps at 24 kHz)
+        let f = opus_frames(3);
         let mut dec = OpusPlaybackDecoder::new(24000, 1).unwrap();
         let q = PlayQueue::new();
         q.configure(1 << 20, 2);
 
-        // Packet 1 (primary ts=1000, no redundancy): anchor, one frame.
         dec.decode_red_into_queue(&build_red_payload(&[], &f[0]), 1000, &q);
-        // Packet 2 (ts=1480) is dropped in transit.
-        // Packet 3 (primary ts=1960, redundant copies of 1000 and 1480).
         let pkt3 = build_red_payload(&[(960, &f[0]), (480, &f[1])], &f[2]);
         dec.decode_red_into_queue(&pkt3, 1960, &q);
 
         let mut out = Vec::new();
         q.drain_upto(1 << 20, &mut out);
-        // 1000 (anchor) + 1480 (recovered) + 1960 (primary); the redundant 1000 is deduped.
         assert_eq!(out.len(), 3 * FRAME_PCM_BYTES);
         assert_eq!(dec.last_ts, Some(1960));
     }
 
-    // With no loss, redundancy is pure overhead: every frame decodes exactly once and the
-    // redundant copies are dropped, so three packets yield three frames -- not more.
+    /// @brief With no loss, redundancy is pure overhead: every frame decodes exactly once and
+    /// the redundant copies are dropped, so three packets yield exactly three frames.
     #[test]
     fn red_playback_no_double_decode() {
         let f = opus_frames(3);
@@ -2451,8 +2691,9 @@ mod tests {
         assert_eq!(dec.last_ts, Some(1960));
     }
 
-    // A too-old (offset > 16383) and an oversize (len > 1023) history block are both
-    // skipped, so n_red counts only the block that fit the RFC 2198 fields.
+    /// @brief A too-old block (offset > 16383, overflowing the 14-bit field) and an oversize
+    /// block (len > 1023, overflowing the 10-bit field) are both skipped, so `n_red` counts
+    /// only the one in-range block that fit the RFC 2198 fields.
     #[test]
     fn red_skips_oversize_and_too_old() {
         let too_old = vec![0x11u8; 3];
@@ -2462,9 +2703,9 @@ mod tests {
         let primary_pts = 100_000u64;
 
         let mut hist: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
-        hist.push_back((too_old, primary_pts - 20_000)); // offset 20000 > 16383 -> skip
-        hist.push_back((oversize, primary_pts - 1920)); // len 1100 > 1023 -> skip
-        hist.push_back((good.clone(), primary_pts - 960)); // fits -> included
+        hist.push_back((too_old, primary_pts - 20_000));
+        hist.push_back((oversize, primary_pts - 1920));
+        hist.push_back((good.clone(), primary_pts - 960));
 
         let body = build_ws_body(&primary, primary_pts, &hist, 4, true);
         assert_eq!(body[0], 0x01);
@@ -2480,13 +2721,14 @@ mod tests {
         assert_eq!(&body[11 + len..], &primary[..]);
     }
 
-    // red_distance > 0 with no usable history is primary-only RED: [0x01,0x00] + a
-    // 1-byte primary header + primary data (distinct from the legacy no-header form).
+    /// @brief `red_distance > 0` with no usable history (e.g. the first frame after a
+    /// (re)start) collapses to exactly the 2-byte `[0x01, 0x00]` + opus framing — the same
+    /// bytes as `n_red == 0`, not a primary-only RED header. The client's `n_red == 0` path
+    /// strips exactly 2 bytes, so emitting a lone primary-only RED header here would be
+    /// mis-stripped and corrupt the frame; the body is asserted to be exactly those 2 bytes
+    /// plus the opus.
     #[test]
     fn red_empty_history_falls_back_to_legacy() {
-        // With RED enabled but no usable redundancy (first frame after a (re)start), the WS
-        // wire must collapse to the legacy 2-byte [0x01,0x00]+opus so the client's n_red==0
-        // path strips exactly 2 bytes -- a lone primary-only RED header would be mis-stripped.
         let opus = vec![0x77u8; 4];
         let hist: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
         let body = build_ws_body(&opus, 960, &hist, 2, true);
@@ -2496,6 +2738,8 @@ mod tests {
         assert_eq!(body.len(), 2 + opus.len());
     }
 
+    /// @brief The all-zero comparison behind the silence gate: an all-zero buffer reads as
+    /// silent, and a single non-zero sample makes it non-silent.
     #[test]
     fn silence_detection() {
         let silent = vec![0i16; 960 * 2];
@@ -2505,16 +2749,18 @@ mod tests {
         assert!(!not.iter().all(|&s| s == 0));
     }
 
-    // Deterministic lost-stop probe against the real stop_state protocol. A "capture
-    // thread" hammers request_self_stop + undo_self_stop (the re-entrant callback
-    // pattern) while another thread issues request_external_stop and waits for the
-    // capture loop's stop_pending() to observe it. The external stop must never be
-    // cleared by a self-start, so the thread always observes it and the join returns
-    // (no hang). The bounded spin count is the in-test watchdog.
+    /// @brief Deterministic lost-stop probe against the real `stop_state` protocol.
+    ///
+    /// A stand-in "capture thread" hammers `request_self_stop` + `undo_self_stop` (the
+    /// re-entrant callback pattern) while another thread issues `request_external_stop` and
+    /// waits for the loop's `stop_pending()` to observe it. The external stop must never be
+    /// cleared by a self-start, so the thread always observes `STOP_EXTERNAL` and the join
+    /// returns (no hang). The bounded spin count is the in-test watchdog; 5000 iterations
+    /// shake out the race.
     #[test]
     fn external_stop_never_lost_to_self_restart() {
         use std::sync::Arc;
-        let me: i64 = 987654; // stand-in capture-thread tid
+        let me: i64 = 987654;
         for _ in 0..5000 {
             let inner = Arc::new(Inner::new());
             let inner_c = inner.clone();
@@ -2523,10 +2769,8 @@ mod tests {
             let h = std::thread::spawn(move || {
                 let mut spins: u64 = 0;
                 loop {
-                    // Re-entrant self-stop then self-start (undo), mirroring the callback.
                     inner_c.request_self_stop(me);
                     inner_c.undo_self_stop(me);
-                    // Capture-loop exit condition.
                     if inner_c.stop_pending()
                         && inner_c.stop_state.load(Ordering::Acquire) == STOP_EXTERNAL
                     {
@@ -2537,47 +2781,49 @@ mod tests {
                     assert!(spins < 50_000_000, "external stop was lost (would hang the join)");
                 }
             });
-            inner.request_external_stop(); // authoritative external stop
+            inner.request_external_stop();
             h.join().unwrap();
             assert!(observed.load(Ordering::Acquire));
-            // External stop stands: a self-start never cleared it back to STOP_NONE.
             assert_eq!(inner.stop_state.load(Ordering::Acquire), STOP_EXTERNAL);
             assert!(inner.stop_pending());
         }
     }
 
-    // Pushing past the byte bound drops the OLDEST bytes, keeping the newest window.
+    /// @brief Pushing past the byte bound drops the OLDEST bytes, keeping the newest window:
+    /// an 8-byte bound fed 12 bytes retains the last 8, and a second drain comes back empty.
     #[test]
     fn playqueue_drop_oldest_keeps_newest() {
         let q = PlayQueue::new();
-        q.configure(8, 2); // 8-byte bound, 2-byte (mono s16) frames
+        q.configure(8, 2);
         q.push(&[1, 2, 3, 4, 5, 6]);
-        q.push(&[7, 8, 9, 10, 11, 12]); // 12 bytes -> drop oldest 4
+        q.push(&[7, 8, 9, 10, 11, 12]);
         let mut out = Vec::new();
         q.drain_upto(100, &mut out);
         assert_eq!(out, vec![5, 6, 7, 8, 9, 10, 11, 12]);
-        // Fully drained now.
         q.drain_upto(100, &mut out);
         assert!(out.is_empty());
     }
 
-    // drain_upto clamps to the requested count AND floors to a whole frame, so a PA
-    // write never gets a partial frame regardless of frame size.
+    /// @brief `drain_upto` clamps to the requested count AND floors to a whole frame, so a PA
+    /// write never gets a partial frame: with 4-byte frames, a request of 7 yields 4 bytes,
+    /// the next drain yields the next 4, and the trailing 2 bytes are withheld as a partial
+    /// frame.
     #[test]
     fn playqueue_drain_is_frame_aligned() {
         let q = PlayQueue::new();
-        q.configure(1000, 4); // 4-byte (stereo s16) frames
-        q.push(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]); // 10 bytes
+        q.configure(1000, 4);
+        q.push(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let mut out = Vec::new();
-        q.drain_upto(7, &mut out); // clamp 7 -> floor to 4
+        q.drain_upto(7, &mut out);
         assert_eq!(out, vec![0, 1, 2, 3]);
-        q.drain_upto(100, &mut out); // 6 left -> floor to 4
+        q.drain_upto(100, &mut out);
         assert_eq!(out, vec![4, 5, 6, 7]);
-        q.drain_upto(100, &mut out); // 2 left -> floor to 0 (partial frame withheld)
+        q.drain_upto(100, &mut out);
         assert!(out.is_empty());
     }
 
-    // configure() applies the new bounds and drops stale audio from a prior run.
+    /// @brief `configure()` applies the new bounds and drops stale audio from a prior run, so
+    /// bytes queued before it are gone afterward.
     #[test]
     fn playqueue_configure_resets() {
         let q = PlayQueue::new();
@@ -2588,10 +2834,11 @@ mod tests {
         assert!(out.is_empty(), "configure must clear stale audio");
     }
 
-    // worker_alive gates AudioPlayback::write. It must hold through the startup
-    // handshake and the healthy run, and go false the moment the hot loop's error
-    // exit clears started_ok -- even with no stop pending and start_state still
-    // RUNNING (the silent mid-run death case).
+    /// @brief `worker_alive` (which gates `AudioPlayback::write`) tracks the lifecycle: it is
+    /// false before any worker, true through the startup handshake and the healthy run, and
+    /// goes false the moment the hot loop's error exit clears `started_ok` — even with no stop
+    /// pending and `start_state` still `RUNNING` (the silent mid-run death case). A pending
+    /// external stop also reads as not-alive.
     #[test]
     fn worker_alive_tracks_loop_error_exit() {
         let inner = Inner::new();
@@ -2600,34 +2847,31 @@ mod tests {
         inner.start_state.store(ST_STARTING, Ordering::Release);
         assert!(inner.worker_alive(), "startup handshake counts as alive");
 
-        // Hot-loop entry.
         inner.started_ok.store(true, Ordering::Release);
         inner.start_state.store(ST_RUNNING, Ordering::Release);
         assert!(inner.worker_alive());
 
-        // Mid-run death: the loop stores started_ok=false and breaks; stop_state
-        // stays STOP_NONE and start_state stays RUNNING.
         inner.started_ok.store(false, Ordering::Release);
         assert_eq!(inner.stop_state.load(Ordering::Acquire), STOP_NONE);
         assert!(!inner.worker_alive(), "dead loop must be observable");
 
-        // A pending external stop also reads as not-alive.
         inner.started_ok.store(true, Ordering::Release);
         inner.request_external_stop();
         assert!(!inner.worker_alive());
     }
 
-    // A LOSING start's failed-start cleanup must never tear down a WINNING start's
-    // freshly spawned thread. Reproduces the bad interleaving: L's worker fails, W
-    // takes the slot over (joins dead L, spawns live W) BEFORE L runs its ST_FAILED
-    // cleanup; the late cleanup must be an identity-mismatch no-op, leaving W
-    // running and still externally stoppable.
+    /// @brief A LOSING start's failed-start cleanup must never tear down a WINNING start's
+    /// freshly spawned thread.
+    ///
+    /// Drives the bad interleaving directly: loser L's worker fails, winner W takes the slot
+    /// over (joins dead L, spawns live W) BEFORE L runs its `ST_FAILED` cleanup. That late
+    /// `join_failed_start` must be an identity-mismatch no-op, leaving W running and still
+    /// tear-down-able through the ordinary external stop path.
     #[test]
     fn failed_start_cleanup_spares_concurrent_winner() {
         let inner = Arc::new(Inner::new());
         let slot: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
-        // L: fails during startup (a bad PA connect).
         let li = inner.clone();
         let l_id = spawn_worker(&slot, &inner, "loser", move || {
             li.started_ok.store(false, Ordering::Release);
@@ -2638,7 +2882,6 @@ mod tests {
             std::thread::yield_now();
         }
 
-        // W: takes over the slot and reaches the hot loop.
         let wi = inner.clone();
         let w_id = spawn_worker(&slot, &inner, "winner", move || {
             wi.started_ok.store(true, Ordering::Release);
@@ -2654,13 +2897,11 @@ mod tests {
             std::thread::yield_now();
         }
 
-        // L's cleanup fires late: the slot now belongs to W, so nothing may change.
         join_failed_start(&slot, &inner, l_id);
         assert!(slot.lock().unwrap().is_some(), "winner's handle must survive");
         assert_eq!(inner.stop_state.load(Ordering::Acquire), STOP_NONE);
         assert!(inner.worker_alive(), "winner must still be running");
 
-        // The ordinary external stop path must still take W down.
         {
             let mut g = slot.lock().unwrap();
             let h = g.take().expect("winner handle present");
@@ -2670,12 +2911,13 @@ mod tests {
         assert!(!inner.worker_alive());
     }
 
-    // Two threads race the full start sequence (spawn_worker + handshake poll +
-    // conditional failed-start cleanup). spawn_worker joins the prior worker before
-    // spawning, so bodies run in spawn order: the first fails, the second serves
-    // until stopped. Whatever the interleaving, the second run must end RUNNING
-    // with no stray stop -- a loser cleanup that killed the winner would leave an
-    // empty slot and STOP_EXTERNAL behind.
+    /// @brief Two threads race the full start sequence (`spawn_worker` + handshake poll +
+    /// conditional failed-start cleanup), 200 times.
+    ///
+    /// `spawn_worker` joins the prior worker before spawning, so the bodies run in spawn
+    /// order: the first fails, the second serves until stopped. Whatever the interleaving,
+    /// the second run must end `RUNNING` with no stray stop — a loser cleanup that killed the
+    /// winner would leave an empty slot and a `STOP_EXTERNAL` behind.
     #[test]
     fn concurrent_start_loser_never_kills_winner() {
         for _ in 0..200 {
@@ -2692,11 +2934,9 @@ mod tests {
                     let bruns = runs.clone();
                     let id = spawn_worker(&slot, &inner, name, move || {
                         if bruns.fetch_add(1, Ordering::AcqRel) == 0 {
-                            // First run: startup failure.
                             bi.started_ok.store(false, Ordering::Release);
                             bi.start_state.store(ST_FAILED, Ordering::Release);
                         } else {
-                            // Second run: hot loop until stopped.
                             bi.started_ok.store(true, Ordering::Release);
                             bi.start_state.store(ST_RUNNING, Ordering::Release);
                             let mut spins: u64 = 0;
@@ -2709,7 +2949,6 @@ mod tests {
                         }
                     })
                     .unwrap();
-                    // Startup handshake, as in start_capture/start.
                     let mut state = inner.start_state.load(Ordering::Acquire);
                     let mut tries = 0;
                     while state == ST_STARTING && tries < 2000 {
@@ -2732,7 +2971,6 @@ mod tests {
             assert_eq!(inner.start_state.load(Ordering::Acquire), ST_RUNNING);
             assert!(inner.worker_alive(), "winner must still be alive after both starts");
 
-            // External stop still reaches the winner.
             {
                 let mut g = slot.lock().unwrap();
                 let h = g.take().expect("winner handle present");
@@ -2743,12 +2981,16 @@ mod tests {
         }
     }
 
+    /// @brief The in-place `write_ws_prefix_into` + appended primary is byte-identical to the
+    /// copy-based `build_ws_body` reference across the full matrix — empty vs mixed history
+    /// (including one block aged out of the 14-bit offset at high pts and one oversized block
+    /// that is always skipped), every `red_distance`, header on/off, and several pts values.
     #[test]
     fn prefix_writer_matches_build_ws_body() {
         let primary: Vec<u8> = (0u8..200).collect();
         let mut mixed: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
-        mixed.push_back((vec![1u8; 100], 0)); // aged out of the 14-bit offset at high pts
-        mixed.push_back((vec![2u8; RED_MAX_LEN + 1], 960)); // oversized, always skipped
+        mixed.push_back((vec![1u8; 100], 0));
+        mixed.push_back((vec![2u8; RED_MAX_LEN + 1], 960));
         mixed.push_back((vec![3u8; 50], 1440));
         mixed.push_back((vec![4u8; 900], 1900));
         for hist in [VecDeque::new(), mixed] {
@@ -2767,6 +3009,9 @@ mod tests {
         }
     }
 
+    /// @brief A truncated buffer returned to the pool comes back as the same allocation
+    /// (recycled) restored to full `buf_size` length, and an undersized foreign buffer is
+    /// rejected rather than pooled.
     #[test]
     fn buffer_pool_recycles_and_restores_length() {
         let pool = BufferPool::new(64);
@@ -2778,11 +3023,12 @@ mod tests {
         let b = pool.take();
         assert_eq!(b.as_ptr() as usize, ptr, "buffer must be recycled");
         assert_eq!(b.len(), 64, "length must be restored");
-        // Undersized foreign buffers are rejected, not pooled.
         pool.put(Vec::new());
         assert_eq!(pool.take().len(), 64);
     }
 
+    /// @brief Dropping an `AudioFrame` whose `pool` is set returns its buffer to that pool,
+    /// so the next `take` hands back the same allocation.
     #[test]
     fn audio_frame_drop_refills_pool() {
         let pool = Arc::new(BufferPool::new(32));
@@ -2793,10 +3039,14 @@ mod tests {
         assert_eq!(recycled.as_ptr() as usize, ptr);
     }
 
-    // Not a correctness test: isolates the emit-path assembly cost (copy-based
-    // build_ws_body + per-frame alloc vs pooled in-place prefix) with the encoder
-    // stubbed to a memcpy. Run with:
-    //   cargo test --release bench_emit_assembly -- --ignored --nocapture
+    /// @brief Micro-benchmark (not a correctness test) isolating the emit-path assembly cost:
+    /// the copy-based `build_ws_body` + per-frame alloc versus the pooled in-place prefix,
+    /// with the encoder stubbed to a memcpy.
+    ///
+    /// `#[ignore]`d by default; run with
+    /// `cargo test --release bench_emit_assembly -- --ignored --nocapture`. The pooled arm
+    /// circulates buffers at the delivery-ring depth (>8 in flight) so refill batching engages
+    /// as it does live — several returns per drain, not one.
     #[test]
     #[ignore]
     fn bench_emit_assembly() {
@@ -2804,7 +3054,7 @@ mod tests {
         use std::time::Instant;
 
         const ITERS: u32 = 500_000;
-        const PAYLOAD: usize = 200; // typical Opus packet at 128 kbps / 10 ms
+        const PAYLOAD: usize = 200;
         let src = vec![0xA5u8; PAYLOAD];
         let mut hist: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
         hist.push_back((vec![6u8; 180], 0));
@@ -2814,14 +3064,12 @@ mod tests {
             let old = Instant::now();
             let mut out = vec![0u8; MAX_OPUS_PACKET];
             for i in 0..ITERS {
-                out[..PAYLOAD].copy_from_slice(&src); // encode stub
+                out[..PAYLOAD].copy_from_slice(&src);
                 let data = build_ws_body(&out[..PAYLOAD], 960 + i as u64, &hist, red, true);
                 black_box(&data);
             }
             let old_ns = old.elapsed().as_nanos() / ITERS as u128;
 
-            // Circulate at the delivery-ring depth so refill batching engages the
-            // way it does live (several returns per drain, not one).
             let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + MAX_OPUS_PACKET));
             let mut taker = PoolTaker::new(Arc::clone(&pool));
             let mut inflight: VecDeque<Vec<u8>> = VecDeque::new();
@@ -2830,12 +3078,12 @@ mod tests {
                 let mut data = taker.take();
                 let prefix =
                     write_ws_prefix_into(&mut data, 960 + i as u64, &hist, red, true);
-                data[prefix..prefix + PAYLOAD].copy_from_slice(&src); // encode stub
+                data[prefix..prefix + PAYLOAD].copy_from_slice(&src);
                 data.truncate(prefix + PAYLOAD);
                 black_box(&data);
                 inflight.push_back(data);
                 if inflight.len() > 8 {
-                    pool.put(inflight.pop_front().unwrap()); // stands in for AudioFrame drop
+                    pool.put(inflight.pop_front().unwrap());
                 }
             }
             let new_ns = new.elapsed().as_nanos() / ITERS as u128;
@@ -2844,6 +3092,11 @@ mod tests {
     }
 }
 
+/// @brief PyO3 module init: register the capture/playback classes and the atexit sweep.
+///
+/// Exposes `AudioCapture`, `AudioCaptureSettings`, `AudioFrame`, `AudioPlayback`, and
+/// `AudioPlaybackSettings`, then registers `_stop_all_captures` on Python's `atexit` so no
+/// still-running capture thread is calling into Python during interpreter finalization.
 #[pymodule]
 fn pcmflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioCapture>()?;
@@ -2852,8 +3105,6 @@ fn pcmflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioPlayback>()?;
     m.add_class::<AudioPlaybackSettings>()?;
     m.add_function(wrap_pyfunction!(_stop_all_captures, m)?)?;
-    // Stop all live captures at interpreter exit so a still-running capture thread
-    // isn't calling into Python during finalization.
     if let Ok(atexit) = m.py().import("atexit") {
         let _ = atexit.call_method1("register", (m.getattr("_stop_all_captures")?,));
     }
