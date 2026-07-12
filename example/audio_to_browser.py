@@ -40,22 +40,25 @@ async def send_audio_chunks():
     print("Audio chunk broadcasting task started.")
     try:
         while True:
-            # Wait for an Opus chunk to arrive from the audio capture thread.
-            opus_bytes = await g_audio_queue.get()
+            # Wait for an Opus chunk (a zero-copy memoryview pinning the
+            # AudioFrame's native buffer) from the audio capture thread.
+            opus_view = await g_audio_queue.get()
 
             # If no clients are connected, just clear the queue item and wait.
             if not g_clients:
+                opus_view.release()  # unpin: recycle the buffer to the pool
                 g_audio_queue.task_done()
                 continue
 
             # pcmflux prepends the 2-byte header [0x01, 0x00] natively
             # (omit_audio_header=False), so forward as-is (no per-frame Python copy).
-            message_to_send = opus_bytes
-
             # Fire-and-forget fan-out: writes into each client's buffer without
             # awaiting per-connection backpressure, so one slow client can't
             # stall delivery to the others. Skips non-open connections.
-            ws_async.broadcast(g_clients, message_to_send)
+            # broadcast() serializes the frame before returning, so the view can
+            # be released as soon as it comes back.
+            ws_async.broadcast(g_clients, opus_view)
+            opus_view.release()
 
             g_audio_queue.task_done()
     except asyncio.CancelledError:
@@ -149,38 +152,45 @@ async def ws_handler(websocket, path=None):
 def py_audio_callback(frame):
     """Per-chunk callback invoked from the native capture thread.
 
-    `frame` is a zero-copy AudioFrame (buffer protocol + `.pts`). Copy it to
-    `bytes` here so nothing outlives this call, then hand off to the loop thread
-    for a non-blocking, drop-oldest enqueue. Silence-gated chunks are never
-    delivered (the callback is skipped for them), so `frame` always carries an
-    encoded payload — no empty-frame check is needed.
+    `frame` is an AudioFrame that OWNS its encoded payload (buffer protocol +
+    `.pts`): a memoryview over it pins the frame — and therefore the native
+    buffer — alive until the view is released, so the chunk is handed to the
+    loop thread with no copy. Dropping the last reference recycles the buffer
+    back to the capture's pool. Silence-gated chunks are never delivered (the
+    callback is skipped for them), so `frame` always carries an encoded
+    payload — no empty-frame check is needed.
     """
     global g_is_capturing, g_audio_queue, g_loop
 
     if g_is_capturing and frame is not None and g_audio_queue is not None:
-        # bytes(frame) copies the payload (header+Opus, or raw Opus per settings).
-        data_bytes = bytes(frame)
+        # Zero-copy: the view aliases the frame's native buffer (header+Opus,
+        # or raw Opus per settings) and keeps the frame alive via the buffer
+        # protocol until the websocket send releases it.
+        data_view = memoryview(frame)
         if g_loop and not g_loop.is_closed():
-            g_loop.call_soon_threadsafe(_enqueue_audio, data_bytes)
+            g_loop.call_soon_threadsafe(_enqueue_audio, data_view)
 
-def _enqueue_audio(data_bytes):
+def _enqueue_audio(data_view):
     """Enqueue one chunk on the loop thread, dropping the oldest if the bounded
-    queue is full, so a stalled client can't grow memory without bound."""
+    queue is full, so a stalled client can't grow memory without bound (each
+    queued view pins one pooled native buffer until it is sent or dropped)."""
     global g_dropped
     q = g_audio_queue
     if q is None:
+        data_view.release()  # queue torn down: unpin the native buffer now
         return
     if q.full():
         try:
-            q.get_nowait()
+            stale = q.get_nowait()
             q.task_done()  # keep unfinished-task accounting balanced
+            stale.release()
             g_dropped += 1
         except asyncio.QueueEmpty:
             pass
     try:
-        q.put_nowait(data_bytes)
+        q.put_nowait(data_view)
     except asyncio.QueueFull:
-        pass
+        data_view.release()
 
 def _resolve_static_path(script_dir, request_path):
     """Return the real path of request_path under script_dir, or None if it

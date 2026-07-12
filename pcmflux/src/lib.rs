@@ -20,18 +20,22 @@
 //! Concurrency design (the invariants below are load-bearing):
 //!   - A lifecycle mutex serializes joining/reassigning the capture thread.
 //!   - A single stop_state atomic is the one source of truth (0 = running, -1 =
-//!     external stop, a positive value = self-stop by that capture thread's tid). The
+//!     external stop, a positive value = self-stop recorded under the issuing thread's
+//!     tid — the delivery thread's for a callback-issued stop). The
 //!     external -1 is stored INSIDE that lock immediately before join, so a stop can
 //!     never be lost between observing a live thread and asking it to stop. A
 //!     re-entrant self-start undoes only its own self-stop via one compare-exchange,
 //!     so a racing external stop is never clobbered.
 //!   - The PulseAudio mainloop is pumped with a bounded ~20ms timeout, so a stop is
 //!     observed within ~20ms even if the audio source delivers no data (is wedged).
-//!   - The GIL is released around join, because the capture thread's final callback
-//!     needs the GIL; holding it while joining would deadlock.
-//!   - A callback may itself call stop/start from the capture thread; that re-entrant
-//!     case is detected via the capture thread's OS tid and short-circuits without
-//!     self-joining.
+//!   - The GIL is released around join, because joining the capture thread transitively
+//!     joins the delivery thread, whose in-flight Python callback needs the GIL; holding
+//!     it while joining would deadlock.
+//!   - A callback may itself call stop/start; the callback runs on the delivery thread,
+//!     so that re-entrant case is detected via the delivery thread's OS tid (the capture
+//!     thread's tid is checked too) and short-circuits without joining — a join from
+//!     inside the callback would cycle (stopper joins capture, capture joins delivery,
+//!     delivery is the stopper).
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -530,20 +534,27 @@ impl AudioFrame {
 ///
 /// The lifecycle is driven by two atomics — `stop_state` (the single source of truth for
 /// "should this run stop") and `start_state` (the STARTING → RUNNING/FAILED startup
-/// handshake) — plus `capture_tid`, the worker's OS tid used to detect a re-entrant
-/// stop/start issued from inside the Python callback. The remaining atomics mirror
+/// handshake) — plus `capture_tid` and `deliver_tid`, the worker and delivery threads'
+/// OS tids used to detect a re-entrant stop/start issued from inside the Python callback
+/// (which runs on the delivery thread). The remaining atomics mirror
 /// settings the worker consults each frame, so `update_audio_bitrate` and the silence /
 /// header flags can change mid-run without locking or re-snapshotting `Settings`.
 struct Inner {
     /// Single lifecycle source of truth: `STOP_NONE` (running), `STOP_EXTERNAL`, or a
-    /// positive tid meaning that capture thread self-stopped from its own callback. A
-    /// re-entrant start clears only its own self-stop via compare-exchange, so it can
-    /// never clobber an external stop that raced in mid-join (which would strand it).
+    /// positive tid meaning the run self-stopped from inside its own callback (recorded
+    /// under the issuing thread's tid — the delivery thread's). A re-entrant start clears
+    /// only its own self-stop via compare-exchange, so it can never clobber an external
+    /// stop that raced in mid-join (which would strand it).
     stop_state: AtomicI64,
     started_ok: AtomicBool,
     start_state: AtomicU8,
     /// OS tid of the running capture thread; `0` when no worker is live.
     capture_tid: AtomicI64,
+    /// OS tid of the running delivery thread (the one that invokes the Python callback);
+    /// `0` when none is live. Checked by the re-entrancy guards alongside `capture_tid`,
+    /// because a stop/start issued from inside the callback executes on THIS thread — a
+    /// join from it would cycle (stopper joins capture, capture joins delivery).
+    deliver_tid: AtomicI64,
     /// Lock-free per-frame settings mirrors, published by start / `update_bitrate` and
     /// re-read by the worker each frame.
     opus_bitrate: AtomicI32,
@@ -559,6 +570,7 @@ impl Inner {
             started_ok: AtomicBool::new(false),
             start_state: AtomicU8::new(0),
             capture_tid: AtomicI64::new(0),
+            deliver_tid: AtomicI64::new(0),
             opus_bitrate: AtomicI32::new(128000),
             use_silence_gate: AtomicBool::new(true),
             debug_logging: AtomicBool::new(false),
@@ -576,7 +588,7 @@ impl Inner {
         self.stop_state.store(STOP_EXTERNAL, Ordering::Release);
     }
 
-    /// @brief Record a re-entrant self-stop from the capture thread's own callback.
+    /// @brief Record a re-entrant self-stop from inside the run's own callback.
     ///
     /// Only transitions `STOP_NONE -> me` via compare-exchange, so it never overwrites a
     /// pending external stop (which must win the join).
@@ -621,6 +633,16 @@ impl Inner {
             return true;
         }
         self.started_ok.load(Ordering::Acquire) && !self.stop_pending()
+    }
+
+    /// @brief True when the calling thread is one of this run's own threads — the capture
+    /// worker or the delivery thread that runs the Python callback — i.e. the call is a
+    /// re-entrant stop/start/drop from inside the callback. Such a caller must never
+    /// join: teardown has the capture thread join the delivery thread, so a join from
+    /// either one closes a cycle and deadlocks.
+    fn is_own_thread(&self, me: i64) -> bool {
+        self.capture_tid.load(Ordering::Acquire) == me
+            || self.deliver_tid.load(Ordering::Acquire) == me
     }
 }
 
@@ -1451,7 +1473,7 @@ impl<'a> RunState<'a> {
 ///    `RunState`. A stop is observed within the pump bound even when the source is wedged. On
 ///    exit it disconnects the stream, drops the encoder, closes and joins the delivery ring,
 ///    and reports any dropped stale frames.
-fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
+fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     inner.opus_bitrate.store(settings.opus_bitrate, Ordering::Relaxed);
     inner.use_silence_gate.store(settings.use_silence_gate, Ordering::Relaxed);
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
@@ -1686,6 +1708,7 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
     let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + max_pkt));
     let deliver_ring = Arc::clone(&ring);
     let deliver_pool = Arc::clone(&pool);
+    let deliver_inner = Arc::clone(inner);
     let deliver_cb: Py<PyAny> = Python::attach(|py| callback.clone_ref(py));
     let deliver_join = std::thread::Builder::new()
         .name("pcmflux-deliver".into())
@@ -1694,6 +1717,7 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
                 let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
                 let _ = libc::setpriority(libc::PRIO_PROCESS, tid, -10);
             }
+            deliver_inner.deliver_tid.store(gettid(), Ordering::Release);
             while let Some((data, pts)) = deliver_ring.pop() {
                 Python::attach(|py| {
                     let frame = match Py::new(
@@ -1711,6 +1735,7 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
                     }
                 });
             }
+            deliver_inner.deliver_tid.store(0, Ordering::Release);
         })
         .ok();
     if deliver_join.is_none() {
@@ -1813,6 +1838,7 @@ fn capture_run(inner: &Inner, settings: &Settings, callback: &Py<PyAny>) {
     if let Some(j) = deliver_join {
         let _ = j.join();
     }
+    inner.deliver_tid.store(0, Ordering::Release);
     let dropped = ring.dropped.load(Ordering::Relaxed);
     if dropped > 0 {
         plog!("[pcmflux] Delivery ring dropped {dropped} stale frame(s) to a slow consumer.");
@@ -2061,16 +2087,19 @@ impl AudioCapture {
 
     /// @brief Start (or restart) audio capture, delivering encoded frames to `callback`.
     ///
-    /// 1. **Re-entrancy guard**: if called on the capture thread itself (the callback called
-    ///    `start`), it cannot join/recreate itself, so it just undoes a nested SELF-stop and
-    ///    returns. That undo is a compare-exchange that clears the stop ONLY if this thread
-    ///    still owns it — if an external stop stored `STOP_EXTERNAL` meanwhile, the CAS fails
-    ///    and that stop stands (clearing it would strand its in-flight join forever).
+    /// 1. **Re-entrancy guard**: if called on one of the run's own threads — the delivery
+    ///    thread (where the Python callback actually executes) or the capture thread — it
+    ///    cannot join/recreate the run it is part of (the capture thread joins the delivery
+    ///    thread on teardown, so a join from either closes a cycle), so it just undoes a
+    ///    nested SELF-stop and returns. That undo is a compare-exchange that clears the stop
+    ///    ONLY if this thread still owns it — if an external stop stored `STOP_EXTERNAL`
+    ///    meanwhile, the CAS fails and that stop stands (clearing it would strand its
+    ///    in-flight join forever).
     /// 2. **Spawn with the GIL released**: `spawn_worker` stops/joins any prior thread and
     ///    spawns the new one via `py.detach`, because the lifecycle lock and `join()` must not
-    ///    be held while holding the GIL — the capture thread's last callback needs the GIL, so
-    ///    that would deadlock. The stop/clear ordering (the lost-stop invariant) lives in
-    ///    `spawn_worker`.
+    ///    be held while holding the GIL — joining the capture thread transitively joins the
+    ///    delivery thread, whose in-flight callback needs the GIL, so that would deadlock.
+    ///    The stop/clear ordering (the lost-stop invariant) lives in `spawn_worker`.
     /// 3. **Register** the handle for the atexit sweep (best-effort), pruning dead weaks.
     /// 4. **Startup handshake**: waits up to ~2 s (GIL released) for the thread to publish
     ///    `RUNNING` or `FAILED`. On `FAILED`, `join_failed_start` tears down ONLY the thread
@@ -2085,7 +2114,7 @@ impl AudioCapture {
         let inner = self.inner().clone();
 
         let me = gettid();
-        if inner.capture_tid.load(Ordering::Acquire) == me {
+        if inner.is_own_thread(me) {
             inner.undo_self_stop(me);
             return Ok(());
         }
@@ -2137,17 +2166,19 @@ impl AudioCapture {
 
     /// @brief Stop audio capture, joining the capture thread.
     ///
-    /// A re-entrant stop from the capture thread itself (the callback called `stop`) only
-    /// records a self-stop — it cannot self-join — and must not clobber an external stop
-    /// already in effect, which has to win the join. Otherwise it takes the lifecycle lock
-    /// and joins with the GIL released (via `py.detach`): the capture thread's last callback
-    /// needs the GIL, so holding it while blocking on the lock or in `join()` would deadlock.
-    /// The authoritative external stop is set INSIDE the lock immediately before the join, so
+    /// A re-entrant stop from one of the run's own threads — the delivery thread (where the
+    /// Python callback executes) or the capture thread — only records a self-stop: a join
+    /// from inside the run would cycle (the capture thread joins the delivery thread on
+    /// teardown). It must not clobber an external stop already in effect, which has to win
+    /// the join. Otherwise it takes the lifecycle lock and joins with the GIL released (via
+    /// `py.detach`): joining the capture thread transitively joins the delivery thread,
+    /// whose in-flight callback needs the GIL, so holding it would deadlock. The
+    /// authoritative external stop is set INSIDE the lock immediately before the join, so
     /// it wins over any concurrent self-stop.
     fn stop_capture(&self, py: Python<'_>) {
         let inner = self.inner();
         let me = gettid();
-        if inner.capture_tid.load(Ordering::Acquire) == me {
+        if inner.is_own_thread(me) {
             inner.request_self_stop(me);
             return;
         }
@@ -2177,13 +2208,14 @@ impl AudioCapture {
 }
 
 impl Drop for AudioCapture {
-    /// @brief Best-effort stop on GC/dealloc: the re-entrant case records a self-stop only
-    /// (never clobbering a pending external stop); otherwise it takes the lifecycle lock and
-    /// joins the capture thread with the GIL released, matching `stop_capture`.
+    /// @brief Best-effort stop on GC/dealloc: the re-entrant case (running on the run's own
+    /// delivery or capture thread) records a self-stop only (never clobbering a pending
+    /// external stop); otherwise it takes the lifecycle lock and joins the capture thread
+    /// with the GIL released, matching `stop_capture`.
     fn drop(&mut self) {
         let inner = &self.shared.inner;
         let me = gettid();
-        if inner.capture_tid.load(Ordering::Acquire) == me {
+        if inner.is_own_thread(me) {
             inner.request_self_stop(me);
             return;
         }
@@ -2459,6 +2491,23 @@ fn _stop_all_captures(py: Python<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// @brief The re-entrancy guard must recognize BOTH of a run's own threads: the
+    /// capture worker AND the delivery thread — the Python callback executes on the
+    /// delivery thread, so a stop/start it issues arrives with the delivery tid, and
+    /// treating it as external would join into the capture→delivery join cycle and
+    /// deadlock.
+    #[test]
+    fn reentrancy_guard_matches_delivery_thread() {
+        let inner = Inner::new();
+        let me = gettid();
+        assert!(!inner.is_own_thread(me), "no run live: nothing should match");
+        inner.deliver_tid.store(me, Ordering::Release);
+        assert!(inner.is_own_thread(me), "delivery tid must short-circuit the guard");
+        inner.deliver_tid.store(0, Ordering::Release);
+        inner.capture_tid.store(me, Ordering::Release);
+        assert!(inner.is_own_thread(me), "capture tid must still short-circuit the guard");
+    }
 
     /// @brief Encode 5.1 with a tone only on FC (input channel 2), decode with the same
     /// layout, and verify the energy comes back on that same channel — proving the
