@@ -1,0 +1,38 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Own one whole capture run end to end on a dedicated thread — connect PulseAudio, encode, and deliver — until stopped. It runs on its own thread because the PulseAudio mainloop must be pumped continuously and independently of Python: sharing the caller’s thread would tie capture cadence to the GIL and let any Python stall starve the audio. The body handed to `spawn_worker`."><title>capture_run in pcmflux - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="pcmflux" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0 (2d8144b78 2026-07-07)" data-channel="1.97.0" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">capture_run</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../pcmflux/index.html">pcmflux</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">pcmflux</a></div><h1>Function <span class="fn">capture_<wbr>run</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/pcmflux/lib.rs.html#1443-1817">Source</a> </span></div><pre class="rust item-decl"><code>pub(crate) fn capture_run(
+    inner: &amp;<a class="struct" href="https://doc.rust-lang.org/1.97.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;<a class="struct" href="struct.Inner.html" title="struct pcmflux::Inner">Inner</a>&gt;,
+    settings: &amp;<a class="struct" href="struct.Settings.html" title="struct pcmflux::Settings">Settings</a>,
+    callback: &amp;Py&lt;PyAny&gt;,
+)</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Own one whole capture run end to end on a dedicated thread — connect PulseAudio,
+encode, and deliver — until stopped. It runs on its own thread because the PulseAudio
+mainloop must be pumped continuously and independently of Python: sharing the caller’s
+thread would tie capture cadence to the GIL and let any Python stall starve the audio.
+The body handed to <code>spawn_worker</code>.</p>
+<p>Publishes <code>start_state</code> for the handshake (<code>FAILED</code> on any startup error, <code>RUNNING</code> on
+entering the hot loop) and returns when <code>stop_state</code> leaves <code>STOP_NONE</code> or on a fatal
+error. The startup sequence, in order:</p>
+<ol>
+<li><strong>Seed the mirrors + validate</strong>: copies the settings snapshot into the <code>Inner</code>
+per-frame atomics, and rejects an invalid Opus frame duration, channel count, or
+sample spec before touching PulseAudio.</li>
+<li><strong>Buffer attr / latency</strong>: a configured <code>latency_ms</code> uses <code>ADJUST_LATENCY</code> with
+<code>fragsize</code> set to that latency; otherwise <code>fragsize</code> is floored at ~20 ms, which yields
+a prompt first frame and avoids PipeWire’s ~2 s default fragment.</li>
+<li><strong>Connect + probe</strong>: drives the context to <code>Ready</code> on the bounded pump (re-checking
+<code>stop_pending</code> each turn), and up-front validates a NAMED device via an introspect
+probe — an async <code>connect_record</code> would not fail synchronously on a bad name. The probe
+closure is called from C inside mainloop dispatch, so its body is <code>catch_unwind</code>-guarded
+to keep a panic from unwinding across the FFI boundary.</li>
+<li><strong>Encoder + record stream</strong>: creates the <code>PcmEncoder</code> (mono/stereo or surround) and
+drives the record stream to <code>Ready</code>.</li>
+<li><strong>Delivery thread</strong>: spawns the delivery thread that pops from the <code>DeliveryRing</code> and
+runs the Python callback there, so GIL stalls cannot back up the PA pump; a callback
+error is reported as an unraisable exception and never propagates into the loop. The
+buffer pool is sized to the worst-case body — RED prefix plus a max Opus packet, scaled
+by stream count for surround (one self-delimited packet per stream).</li>
+<li><strong>Hot loop</strong>: <code>pump</code>s on the ~20 ms bound, then drains every buffered fragment via
+peek/discard (a <code>Hole</code> is an xrun — the read index is just advanced), feeding each into
+<code>RunState</code>. A stop is observed within the pump bound even when the source is wedged. On
+exit it disconnects the stream, drops the encoder, closes and joins the delivery ring,
+and reports any dropped stale frames.</li>
+</ol>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["pcmflux",[["impl PyMethods&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioCapture.html\" title=\"struct pcmflux::AudioCapture\">AudioCapture</a>&gt; for PyClassImplCollector&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioCapture.html\" title=\"struct pcmflux::AudioCapture\">AudioCapture</a>&gt;",0],["impl PyMethods&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioCaptureSettings.html\" title=\"struct pcmflux::AudioCaptureSettings\">AudioCaptureSettings</a>&gt; for PyClassImplCollector&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioCaptureSettings.html\" title=\"struct pcmflux::AudioCaptureSettings\">AudioCaptureSettings</a>&gt;",0],["impl PyMethods&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioFrame.html\" title=\"struct pcmflux::AudioFrame\">AudioFrame</a>&gt; for PyClassImplCollector&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioFrame.html\" title=\"struct pcmflux::AudioFrame\">AudioFrame</a>&gt;",0],["impl PyMethods&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioPlayback.html\" title=\"struct pcmflux::AudioPlayback\">AudioPlayback</a>&gt; for PyClassImplCollector&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioPlayback.html\" title=\"struct pcmflux::AudioPlayback\">AudioPlayback</a>&gt;",0],["impl PyMethods&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioPlaybackSettings.html\" title=\"struct pcmflux::AudioPlaybackSettings\">AudioPlaybackSettings</a>&gt; for PyClassImplCollector&lt;<a class=\"struct\" href=\"pcmflux/struct.AudioPlaybackSettings.html\" title=\"struct pcmflux::AudioPlaybackSettings\">AudioPlaybackSettings</a>&gt;",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[1589]}
