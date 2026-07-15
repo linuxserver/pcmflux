@@ -18,8 +18,6 @@ setup(
     long_description_content_type="text/markdown",
     license="MPL-2.0",
     url="https://github.com/linuxserver/pcmflux",
-    # Single self-contained Rust extension: the top-level `pcmflux` module does
-    # PulseAudio capture + Opus encoding. No C/C++ sources, no Python package layer.
     packages=[],
     rust_extensions=[
         RustExtension(

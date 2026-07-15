@@ -406,10 +406,6 @@ struct AudioCaptureSettings {
     omit_audio_header: bool,
     #[pyo3(get, set)]
     red_distance: i32,
-    /// Informational parity field with pixelflux: frames always own their buffers
-    /// (freed/recycled on last reference), so holding a frame past the callback is safe.
-    #[pyo3(get, set)]
-    deferred_free: bool,
 }
 
 #[pymethods]
@@ -428,7 +424,6 @@ impl AudioCaptureSettings {
             latency_ms: 0,
             omit_audio_header: false,
             red_distance: 0,
-            deferred_free: false,
         }
     }
 }
@@ -2598,7 +2593,7 @@ mod tests {
     /// @brief `red_distance == 0` produces exactly the 2-byte `[0x01, 0x00]` + opus framing,
     /// and the omit-header path returns the raw opus with no prefix at all.
     #[test]
-    fn red_zero_is_byte_identical_legacy() {
+    fn red_zero_is_byte_identical() {
         let opus = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42];
         let hist: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
 
@@ -2777,7 +2772,7 @@ mod tests {
     /// mis-stripped and corrupt the frame; the body is asserted to be exactly those 2 bytes
     /// plus the opus.
     #[test]
-    fn red_empty_history_falls_back_to_legacy() {
+    fn red_empty_history_collapses_to_bare_header() {
         let opus = vec![0x77u8; 4];
         let hist: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
         let body = build_ws_body(&opus, 960, &hist, 2, true);
