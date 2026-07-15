@@ -1,11 +1,15 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 import asyncio
-import ctypes
 import mimetypes
 import os
+import urllib.parse
 import websockets
 import websockets.asyncio.server as ws_async
 
-from pcmflux import AudioCapture, AudioCaptureSettings, AudioChunkCallback
+from pcmflux import AudioCapture, AudioCaptureSettings
 
 # --- Global Shared Context ---
 # These variables manage the server's shared state across different asynchronous
@@ -16,9 +20,14 @@ g_callback = None       # The C-compatible callback function pointer.
 g_module = None         # The pcmflux.AudioCapture module instance.
 g_clients = set()       # A set of currently connected WebSocket clients.
 g_is_capturing = False  # A flag to track the audio capture state.
-g_audio_queue = None    # An asyncio.Queue for passing audio data between threads.
+g_audio_queue = None    # A bounded asyncio.Queue for passing audio between threads.
 g_send_task = None      # The asyncio.Task that broadcasts audio to clients.
+g_status_task = None    # The asyncio.Task that periodically logs queue/drop stats.
+g_dropped = 0           # Audio frames dropped because the queue was full.
 # --- End Global Context ---
+
+# ~4s of 20ms frames; bounds memory if a client stalls and stops draining.
+AUDIO_QUEUE_MAXSIZE = 200
 
 async def send_audio_chunks():
     """
@@ -31,32 +40,43 @@ async def send_audio_chunks():
     print("Audio chunk broadcasting task started.")
     try:
         while True:
-            # Wait for an Opus chunk to arrive from the audio capture thread.
-            opus_bytes = await g_audio_queue.get()
+            # Wait for an Opus chunk (a zero-copy memoryview pinning the
+            # AudioFrame's native buffer) from the audio capture thread.
+            opus_view = await g_audio_queue.get()
 
             # If no clients are connected, just clear the queue item and wait.
             if not g_clients:
+                opus_view.release()  # unpin: recycle the buffer to the pool
                 g_audio_queue.task_done()
                 continue
 
-            # We define a simple protocol: a 1-byte header (0x01) indicates
-            # that the payload is an Opus audio chunk.
-            message_to_send = b'\x01' + opus_bytes
-
-            # Broadcast the message to all clients concurrently.
-            active_clients = list(g_clients)
-            tasks = [client.send(message_to_send) for client in active_clients]
-            if tasks:
-                # asyncio.gather runs all send operations in parallel.
-                # `return_exceptions=True` prevents one failed send (e.g., a
-                # disconnected client) from stopping the entire broadcast.
-                await asyncio.gather(*tasks, return_exceptions=True)
+            # pcmflux prepends the 2-byte header [0x01, 0x00] natively
+            # (omit_audio_header=False), so forward as-is (no per-frame Python copy).
+            # Fire-and-forget fan-out: writes into each client's buffer without
+            # awaiting per-connection backpressure, so one slow client can't
+            # stall delivery to the others. Skips non-open connections.
+            # broadcast() serializes the frame before returning, so the view can
+            # be released as soon as it comes back.
+            ws_async.broadcast(g_clients, opus_view)
+            opus_view.release()
 
             g_audio_queue.task_done()
     except asyncio.CancelledError:
         print("Audio chunk broadcasting task cancelled.")
     finally:
         print("Audio chunk broadcasting task finished.")
+
+async def status_logger():
+    """Periodically logs queue depth and dropped-frame count so backpressure
+    drops are visible rather than silent."""
+    try:
+        while True:
+            await asyncio.sleep(5)
+            q = g_audio_queue
+            print(f"[server] queued={q.qsize() if q else 0}, "
+                  f"dropped={g_dropped}, clients={len(g_clients)}")
+    except asyncio.CancelledError:
+        pass
 
 async def health_check(connection, request):
     """
@@ -81,7 +101,7 @@ async def ws_handler(websocket, path=None):
     that system resources are only used when needed.
     """
     global g_clients, g_is_capturing, g_audio_queue, g_module, g_send_task
-    global g_settings, g_callback
+    global g_settings, g_callback, g_status_task
 
     # Register the new client.
     g_clients.add(websocket)
@@ -91,13 +111,15 @@ async def ws_handler(websocket, path=None):
     # If this is the first client, start the audio capture process.
     if not g_is_capturing and g_module:
         print("First client connected. Starting audio capture...")
-        g_audio_queue = asyncio.Queue()
+        g_audio_queue = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
         g_module.start_capture(g_settings, g_callback)
         g_is_capturing = True
 
-        # Ensure the broadcasting task is running.
+        # Ensure the broadcasting and status tasks are running.
         if g_send_task is None or g_send_task.done():
             g_send_task = asyncio.create_task(send_audio_chunks())
+        if g_status_task is None or g_status_task.done():
+            g_status_task = asyncio.create_task(status_logger())
         print("Audio capture process initiated.")
 
     try:
@@ -121,36 +143,68 @@ async def ws_handler(websocket, path=None):
             if g_send_task:
                 g_send_task.cancel()
                 g_send_task = None
+            if g_status_task:
+                g_status_task.cancel()
+                g_status_task = None
             g_audio_queue = None
             print("Audio capture process stopped.")
 
-def py_audio_callback(result_ptr, user_data):
-    """
-    A C-style callback function that bridges the C++ and Python worlds.
+def py_audio_callback(frame):
+    """Per-chunk callback invoked from the native capture thread.
 
-    This function is not called directly by Python. It is passed as a function
-    pointer to the C++ `pcmflux` library, which calls it from a separate
-    thread whenever a new Opus audio chunk is encoded.
+    `frame` is an AudioFrame that OWNS its encoded payload (buffer protocol +
+    `.pts`): a memoryview over it pins the frame — and therefore the native
+    buffer — alive until the view is released, so the chunk is handed to the
+    loop thread with no copy. Dropping the last reference recycles the buffer
+    back to the capture's pool. Silence-gated chunks are never delivered (the
+    callback is skipped for them), so `frame` always carries an encoded
+    payload — no empty-frame check is needed.
     """
     global g_is_capturing, g_audio_queue, g_loop
 
-    if g_is_capturing and result_ptr and g_audio_queue is not None:
-        # Dereference the C pointer to access the result struct.
-        result = result_ptr.contents
-        if result.data and result.size > 0:
-            # Convert the raw C data (unsigned char*) into a Python `bytes` object.
-            data_bytes = bytes(ctypes.cast(
-                result.data, ctypes.POINTER(ctypes.c_ubyte * result.size)
-            ).contents)
+    if g_is_capturing and frame is not None and g_audio_queue is not None:
+        # Zero-copy: the view aliases the frame's native buffer (header+Opus,
+        # or raw Opus per settings) and keeps the frame alive via the buffer
+        # protocol until the websocket send releases it.
+        data_view = memoryview(frame)
+        if g_loop and not g_loop.is_closed():
+            g_loop.call_soon_threadsafe(_enqueue_audio, data_view)
 
-            # Since this callback runs in a different thread, we must use a
-            # thread-safe method to put data onto the asyncio queue.
-            if g_loop and not g_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    g_audio_queue.put(data_bytes), g_loop)
+def _enqueue_audio(data_view):
+    """Enqueue one chunk on the loop thread, dropping the oldest if the bounded
+    queue is full, so a stalled client can't grow memory without bound (each
+    queued view pins one pooled native buffer until it is sent or dropped)."""
+    global g_dropped
+    q = g_audio_queue
+    if q is None:
+        data_view.release()  # queue torn down: unpin the native buffer now
+        return
+    if q.full():
+        try:
+            stale = q.get_nowait()
+            q.task_done()  # keep unfinished-task accounting balanced
+            stale.release()
+            g_dropped += 1
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        q.put_nowait(data_view)
+    except asyncio.QueueFull:
+        data_view.release()
 
-    # The pcmflux Python wrapper automatically frees the underlying C++ memory
-    # after this function returns.
+def _resolve_static_path(script_dir, request_path):
+    """Return the real path of request_path under script_dir, or None if it
+    escapes. realpath canonicalizes '..'/symlinks and the root+os.sep boundary
+    rejects sibling-prefix dirs; the path is URL-decoded first."""
+    decoded = urllib.parse.unquote(request_path)
+    root = os.path.realpath(script_dir)
+    try:
+        requested = os.path.realpath(os.path.join(root, decoded.lstrip('/')))
+    except ValueError:
+        return None  # e.g. embedded NUL byte ("%00")
+    if requested != root and not requested.startswith(root + os.sep):
+        return None
+    return requested
 
 async def handle_http_request(reader, writer):
     """Handle HTTP requests by serving static files from the script directory."""
@@ -161,7 +215,7 @@ async def handle_http_request(reader, writer):
 
         parts = request_line.split()
         if len(parts) < 2 or parts[0] != b'GET':
-            writer.write(b'HTTP/1.1 405 Method Not Allowed\r\n\r\n')
+            writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
 
         path = parts[1].decode()
@@ -169,11 +223,11 @@ async def handle_http_request(reader, writer):
             path = '/index.html'
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = os.path.join(script_dir, path.lstrip('/'))
+        full_path = _resolve_static_path(script_dir, path)
 
-        # Security check: prevent directory traversal
-        if not full_path.startswith(script_dir):
-            writer.write(b'HTTP/1.1 403 Forbidden\r\n\r\n')
+        # Security check: reject directory traversal / escapes outside script_dir.
+        if full_path is None:
+            writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
 
         if os.path.isfile(full_path):
@@ -182,17 +236,22 @@ async def handle_http_request(reader, writer):
 
             content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
 
-            headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\n\r\n'
+            headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n'
             writer.write(headers.encode())
             writer.write(content)
         else:
-            writer.write(b'HTTP/1.1 404 Not Found\r\n\r\n')
+            writer.write(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
 
     except Exception as e:
         print(f"[HTTP Error] {e}")
-        writer.write(b'HTTP/1.1 500 Internal Server Error\r\n\r\n')
+        writer.write(b'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
     finally:
-        await writer.drain()
+        # The client may already be gone; draining/closing a dead connection
+        # must not raise out of the handler.
+        try:
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
         writer.close()
 
 async def main_async():
@@ -207,19 +266,29 @@ async def main_async():
     # the name of your output's ".monitor" source. Use `pactl list sources`
     # in a terminal to find available source names.
     # To use the system's default microphone, set device_name to None or b''.
-    g_settings.device_name = b"alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor"
+    # The same variables selkies accepts override the template values here (the
+    # library reads no SELKIES_* environment itself — each knob is a settings field).
+    g_settings.device_name = os.environ.get(
+        "SELKIES_AUDIO_DEVICE_NAME",
+        "alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor",
+    ).encode("utf-8")
     #g_settings.device_name = None
     g_settings.sample_rate = 48000
-    g_settings.channels = 2
-    g_settings.opus_bitrate = 128000
-    g_settings.frame_duration_ms = 20
+    g_settings.channels = int(os.environ.get("SELKIES_AUDIO_CHANNELS", "2"))
+    g_settings.opus_bitrate = int(os.environ.get("SELKIES_AUDIO_BITRATE", "128000"))
+    g_settings.frame_duration_ms = int(
+        os.environ.get("SELKIES_AUDIO_FRAME_DURATION_MS", "20")
+    )
     g_settings.use_vbr = True
     g_settings.use_silence_gate = False
     g_settings.debug_logging = True
+    # Emit the 2-byte audio header [0x01, 0x00] natively in the extension (the default).
+    # Set True only for a raw-Opus/WebRTC transport that adds no header.
+    g_settings.omit_audio_header = False
     # --- End Configuration ---
 
-    # Create the C-compatible callback object.
-    g_callback = AudioChunkCallback(py_audio_callback)
+    # Pass the plain Python callback; the wrapper marshals it once internally.
+    g_callback = py_audio_callback
     g_module = AudioCapture()
     print("pcmflux audio capture module initialized.")
 
@@ -227,8 +296,8 @@ async def main_async():
     http_server = await asyncio.start_server(
         handle_http_request, 'localhost', 9001
     )
-    print(f"HTTP server is serving files from current directory")
-    print(f"-> Open http://localhost:9001/index.html in your browser.")
+    print("HTTP server is serving files from current directory")
+    print("-> Open http://localhost:9001/index.html in your browser.")
 
     # Start the WebSocket server.
     ws_server = await ws_async.serve(
@@ -239,23 +308,34 @@ async def main_async():
     )
     print("WebSocket server started on ws://localhost:9000")
 
+    global g_send_task, g_status_task
     try:
         # Keep the main coroutine running indefinitely.
         await asyncio.Event().wait()
     except KeyboardInterrupt:
         pass
     finally:
-        # Perform a graceful shutdown on Ctrl+C.
+        # Stop capture first (joins the native capture thread, stops enqueuing), then cancel
+        # the consumer tasks, then close the servers.
         print("\nShutting down...")
-        if g_is_capturing and g_module:
-            g_module.stop_capture()
-        if g_send_task:
-            g_send_task.cancel()
-        if ws_server:
-            ws_server.close()
-            await ws_server.wait_closed()
         if g_module:
-            del g_module
+            g_module.stop_capture()
+        for task in (g_send_task, g_status_task):
+            if task:
+                task.cancel()
+        # Await the cancellations together; CancelledError is expected per task.
+        pending = [t for t in (g_send_task, g_status_task) if t]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        g_send_task = None
+        g_status_task = None
+        for server in (ws_server, http_server):
+            if server:
+                server.close()
+                await server.wait_closed()
+        # Drop the last reference so AudioCapture.__del__ releases the native capture resources.
+        if g_module:
+            g_module = None
         print("Cleanup complete.")
 
 if __name__ == "__main__":

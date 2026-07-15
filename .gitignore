@@ -48,7 +48,7 @@ instance/
 .scrapy
 docs/_build/
 .pybuilder/
-target/
+target*/
 .ipynb_checkpoints
 profile_default/
 ipython_config.py
@@ -75,3 +75,4 @@ dmypy.json
 cython_debug/
 .ruff_cache/
 .pypirc
+Cargo.lock

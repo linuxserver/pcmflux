@@ -1,29 +1,42 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "setuptools-rust"]
 build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
 archs = [ "x86_64", "aarch64" ]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*t-* pp*"
+
+[tool.cibuildwheel.environment]
+PATH = "$HOME/.cargo/bin:$PATH"
 
 [tool.cibuildwheel.linux]
 before-all = """
     set -euxo pipefail
+    # Rust toolchain (the extension is pure Rust via setuptools-rust/PyO3).
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    # libpulse (libpulse-sys links it) + libopus (audiopus_sys links/builds it; cmake builds the
+    # vendored copy when no system libopus is found). gcc/cmake cover the -sys build steps.
     if command -v dnf; then
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-8.noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-$(rpm -E %rhel).noarch.rpm && \
+        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm && \
         dnf install -y \
             pulseaudio-libs-devel \
             opus-devel \
             gcc \
-            gcc-c++ && \
+            gcc-c++ \
+            cmake && \
         ldconfig
 
     elif command -v apk; then
         apk add --no-cache \
+            build-base \
+            cmake \
             pulseaudio-dev \
-            opus-dev \
-            musl-dev 
+            opus-dev
     else
         echo "Unsupported package manager"
         exit 1
