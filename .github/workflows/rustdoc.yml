@@ -1,22 +1,14 @@
-name: Rustdoc
+name: Docs
 
 on:
   push:
     branches: [master]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -25,26 +17,25 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libpulse-dev libopus-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpulse-dev libopus-dev
 
-      - name: Build rustdoc
-        run: cargo doc --no-deps --document-private-items
-        env:
-          RUSTDOCFLAGS: "--cfg docsrs"
+      - name: Build docs
+        run: cargo doc --no-deps
+        working-directory: pcmflux
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Prepare site
+        run: |
+          touch pcmflux/target/doc/.nojekyll
+          cat > pcmflux/target/doc/index.html << 'EOF'
+          <!DOCTYPE html>
+          <meta http-equiv="refresh" content="0; url=pcmflux/index.html">
+          <a href="pcmflux/index.html">Redirecting...</a>
+          EOF
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: target/doc
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: pcmflux/target/doc
+          keep_files: true
