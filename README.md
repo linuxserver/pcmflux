@@ -1,5 +1,8 @@
 # pcmflux
 
+[![PyPI version](https://badge.fury.io/py/pcmflux.svg)](https://badge.fury.io/py/pcmflux)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://linuxserver.github.io/pcmflux/)
+
 pcmflux is a high-performance audio capture and encoding module for Python.
 
 It is designed to capture system audio using PulseAudio, encode it into the Opus format, and stream it with low latency. A key optimization is its ability to detect and discard silent audio chunks, significantly reducing network traffic and CPU usage during periods of no sound.

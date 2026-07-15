@@ -55,21 +55,15 @@ use pulse::time::MicroSeconds;
 
 use opus::{Application, Channels};
 
-/// @brief Log to stdout without ever panicking, so a broken output pipe can't unwind out
-/// of the capture thread or a Python callback and tear the whole run down.
-///
-/// The reason this exists at all: Rust's std `println!`/`eprintln!` **panic** on any write
-/// error other than EBADF — e.g. EPIPE when a piped stdout reader exits (`... | head`).
-/// That panic would unwind across the capture thread or the Python callback boundary, so
-/// this locks stdout and swallows the write error instead, while preserving the exact
-/// message text and stream.
+/// Non-panicking `println!` replacement that swallows write errors (e.g. EPIPE) instead
+/// of panicking, so a broken output pipe can't unwind the capture thread or a callback.
 macro_rules! plog {
     ($($arg:tt)*) => {{
         use std::io::Write;
         let _ = writeln!(std::io::stdout().lock(), $($arg)*);
     }};
 }
-/// @brief Non-panicking `eprintln!` replacement — the stderr sibling of `plog!`.
+/// Non-panicking `eprintln!` replacement — the stderr sibling of `plog!`.
 macro_rules! elog {
     ($($arg:tt)*) => {{
         use std::io::Write;
@@ -77,58 +71,44 @@ macro_rules! elog {
     }};
 }
 
-/// @brief Identify the calling thread, so a stop/start issued from inside the Python
-/// callback can tell it is running ON the capture thread and must not try to join itself.
-///
-/// The worker publishes this OS thread id (the Linux `gettid` syscall) into an atomic at
-/// startup; a re-entrant stop/start then compares against it and short-circuits instead of
-/// self-joining, which would otherwise deadlock the thread against its own `join()`.
+/// Returns the calling thread's OS tid (`gettid` syscall) so a stop/start issued from
+/// inside the Python callback can detect it is on the capture thread and avoid self-joining.
 #[inline]
 fn gettid() -> i64 {
     unsafe { libc::syscall(libc::SYS_gettid) as i64 }
 }
 
-/// @brief `start_state` handshake value published by the worker: startup in progress.
+/// `start_state` handshake: startup in progress.
 const ST_STARTING: u8 = 1;
-/// @brief `start_state` handshake value: the hot loop is running.
+/// `start_state` handshake: the hot loop is running.
 const ST_RUNNING: u8 = 2;
-/// @brief `start_state` handshake value: startup failed (details on stderr).
+/// `start_state` handshake: startup failed.
 const ST_FAILED: u8 = 3;
 
-/// @brief `stop_state` sentinel: no stop pending (running).
+/// `stop_state` sentinel: no stop pending (running).
 const STOP_NONE: i64 = 0;
-/// @brief `stop_state` sentinel: authoritative external stop. Any positive `stop_state`
-/// instead is the OS tid of a capture thread that self-stopped from its own callback.
+/// `stop_state` sentinel: authoritative external stop (-1). Any positive value
+/// instead is the OS tid of a capture thread that self-stopped from its callback.
 const STOP_EXTERNAL: i64 = -1;
 
-/// @brief PulseAudio mainloop pump timeout (~20 ms) — the upper bound on how long a
-/// pending stop can go unobserved even when the audio source delivers nothing.
+/// PulseAudio mainloop pump timeout (~20 ms) — upper bound on how long a pending
+/// stop can go unobserved even when the audio source delivers nothing.
 const PUMP_TIMEOUT_US: u64 = 20 * 1000;
-/// @brief Per-stream Opus output ceiling in bytes — the upper bound that sizes the emit
-/// buffer pool so an encoded packet is guaranteed to fit; surround scales it by stream count.
+/// Max Opus output packet size in bytes per stream; sizes the emit buffer pool.
 const MAX_OPUS_PACKET: usize = 4000;
 
-/// @brief Max RFC 2198 RED timestamp offset — the 14-bit offset field's ceiling, in
-/// 48 kHz samples back from the primary. RED recovers NetEQ concealment under packet
-/// loss on unreliable transports; over reliable TCP it is redundant by design. A
-/// history block whose offset overflows this is dropped.
+/// Max RED timestamp offset — 14-bit ceiling in 48 kHz samples from the primary.
 const RED_MAX_OFFSET: u64 = 16383;
-/// @brief Max RFC 2198 RED block length — the 10-bit length field's ceiling, in bytes.
-/// A redundant packet larger than this is dropped.
+/// Max RED block length — 10-bit ceiling in bytes.
 const RED_MAX_LEN: usize = 1023;
-/// @brief RFC 2198 RED block payload type. Nominal on the WS path, where the client
-/// decodes only the primary block as Opus.
+/// RED block payload type.
 const RED_BLOCK_PT: u8 = 0;
-/// @brief Max redundant copies carried per frame, and the RED history depth — the ceiling
-/// on how many consecutive lost packets can still be recovered, traded against the extra
-/// bandwidth every redundant copy costs on the wire.
+/// Max redundant copies per frame and RED history depth.
 const RED_MAX_DISTANCE: i32 = 4;
 
-/// @brief The readable reference oracle for the WS audio frame body — the encoded primary
-/// Opus packet plus its RFC 2198 RED redundant history. It exists so the fast, pooled,
-/// in-place `write_ws_prefix_into` on the hot path has a simple allocating definition of
-/// the exact wire bytes to be asserted byte-for-byte equal against. `#[cfg(test)]` only;
-/// the runtime never calls it.
+/// Test-only reference implementation of the WS audio frame body — builds the
+/// full RFC 2198 RED framing + primary Opus packet for byte-for-byte assertion
+/// against the pooled in-place `write_ws_prefix_into` on the hot path.
 ///
 /// RED carries redundant copies of recent frames alongside each primary, so a client on a
 /// lossy transport can rebuild a dropped packet from the next one it receives with no
@@ -211,20 +191,13 @@ fn build_ws_body(
     out
 }
 
-/// @brief Worst-case byte length of the WS frame PREFIX: tag + `n_red` + the 4-byte pts +
-/// `RED_MAX_DISTANCE` 4-byte block headers + the 1-byte primary header + the redundant
-/// block payloads themselves. Sizes the buffer pool so the prefix always fits.
+/// Worst-case byte length of the WS frame prefix (tag + n_red + pts + headers + payloads).
 const RED_PREFIX_MAX: usize =
     6 + 4 * RED_MAX_DISTANCE as usize + 1 + RED_MAX_DISTANCE as usize * RED_MAX_LEN;
 
-/// @brief Emit the RFC 2198 RED framing PREFIX (everything before the primary payload) into
-/// `buf` in place and return its length, so the encoder can serialize the primary Opus
-/// packet DIRECTLY after it and the frame is assembled with no scratch buffer and no
-/// per-frame allocation. This runs on every captured frame, so an assembly copy here would
-/// be pure steady-state overhead — the in-place split is the point of the function.
-///
-/// The runtime counterpart of `build_ws_body` — byte-for-byte the same framing (asserted
-/// equal in tests), but split so the caller appends the primary itself:
+/// Emit the RFC 2198 RED framing prefix into `buf` in-place and return its length,
+/// so the encoder can serialize the Opus packet directly after it with no scratch
+/// buffer and no per-frame allocation. The runtime counterpart of `build_ws_body`.
 ///
 /// 1. **Header omitted**: returns `0`; the caller emits the raw primary with no prefix.
 /// 2. **`red_distance > 0` with usable history**: writes the full RED header — tag,
@@ -289,8 +262,7 @@ fn write_ws_prefix_into(
     2
 }
 
-/// @brief Capture/encode settings, snapshotted from the Python `AudioCaptureSettings`
-/// at start so the capture thread owns an immutable copy for the run's lifetime.
+/// Capture/encode settings, snapshotted from `AudioCaptureSettings` at start.
 #[derive(Clone)]
 struct Settings {
     device_name: Option<String>,
@@ -306,7 +278,7 @@ struct Settings {
     red_distance: i32,
 }
 
-/// @brief True if `ms` is a valid Opus frame duration (2.5, 5, 10, 20, 40, or 60 ms).
+/// True if `ms` is a valid Opus frame duration (2.5, 5, 10, 20, 40, or 60 ms).
 ///
 /// The comparison is done in tenths of a millisecond (`round(ms * 10)`) so the fractional
 /// 2.5 ms case is accepted exactly, without float-equality pitfalls.
@@ -314,7 +286,7 @@ fn valid_opus_duration(ms: f64) -> bool {
     matches!((ms * 10.0).round() as i64, 25 | 50 | 100 | 200 | 400 | 600)
 }
 
-/// @brief Normalize a Python `device_name` (`str | bytes | None`) into `Option<String>`,
+/// Normalize a Python `device_name` (`str | bytes | None`) into `Option<String>`,
 /// mapping both `None` and the empty string to `None` (meaning the system default).
 /// Shared by the capture and playback settings extractors.
 fn parse_device_name(dev_obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
@@ -332,7 +304,7 @@ fn parse_device_name(dev_obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     }
 }
 
-/// @brief Read a Python `AudioCaptureSettings` into a Rust `Settings` by attribute name.
+/// Read a Python `AudioCaptureSettings` into a Rust `Settings` by attribute name.
 ///
 /// `red_distance` is clamped into `[0, RED_MAX_DISTANCE]` — it selects how many redundant
 /// Opus copies each frame carries, and cannot exceed the RFC 2198 history depth.
@@ -353,7 +325,7 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
     })
 }
 
-/// @brief Playback settings, snapshotted from the Python `AudioPlaybackSettings` at
+/// Playback settings, snapshotted from the Python `AudioPlaybackSettings` at
 /// start so the playback thread owns an immutable copy for the run's lifetime.
 #[derive(Clone)]
 struct PbSettings {
@@ -365,7 +337,7 @@ struct PbSettings {
     debug_logging: bool,
 }
 
-/// @brief Read a Python `AudioPlaybackSettings` into a Rust `PbSettings` by attribute name.
+/// Read a Python `AudioPlaybackSettings` into a Rust `PbSettings` by attribute name.
 fn extract_pb_settings(s: &Bound<'_, PyAny>) -> PyResult<PbSettings> {
     Ok(PbSettings {
         device_name: parse_device_name(&s.getattr("device_name")?)?,
@@ -377,7 +349,7 @@ fn extract_pb_settings(s: &Bound<'_, PyAny>) -> PyResult<PbSettings> {
     })
 }
 
-/// @brief Python-facing capture/encode configuration read by `start_capture`.
+/// Python-facing capture/encode configuration read by `start_capture`.
 ///
 /// Declared `#[pyclass(dict)]` so callers may stash extra attributes on instances; the
 /// fields below are the ones read by attribute name in `extract_settings`. `device_name`
@@ -428,7 +400,7 @@ impl AudioCaptureSettings {
     }
 }
 
-/// @brief Python-facing mic-playback configuration read by `AudioPlayback.start`.
+/// Python-facing mic-playback configuration read by `AudioPlayback.start`.
 ///
 /// Defaults match the client mic wire (S16LE / mono / 24 kHz). `max_buffer_bytes` is the
 /// single byte bound on the drop-oldest playback queue (~2 s at 24 kHz mono s16), and
@@ -464,7 +436,7 @@ impl AudioPlaybackSettings {
     }
 }
 
-/// @brief Zero-copy buffer-protocol result type handed to the Python callback.
+/// Zero-copy buffer-protocol result type handed to the Python callback.
 ///
 /// Owns its `Vec<u8>` and exposes it read-only through the buffer protocol, so Python can
 /// read the encoded frame without a copy. When the last Python reference is released and
@@ -497,7 +469,7 @@ impl AudioFrame {
         self.pts
     }
 
-    /// @brief Expose the owned bytes to Python's buffer protocol without a copy.
+    /// Expose the owned bytes to Python's buffer protocol without a copy.
     ///
     /// `PyBuffer_FillInfo` INCREFs `slf` into `view->obj`, pinning the `Vec` alive until
     /// every `memoryview` / slice over it is released. The view is readonly, so the
@@ -524,7 +496,7 @@ impl AudioFrame {
     unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
-/// @brief Lock-free shared state for one capture (or playback) run: the lifecycle
+/// Lock-free shared state for one capture (or playback) run: the lifecycle
 /// state machine plus the per-frame settings mirrors the worker reads on the hot path.
 ///
 /// The lifecycle is driven by two atomics — `stop_state` (the single source of truth for
@@ -573,7 +545,7 @@ impl Inner {
         }
     }
 
-    /// @brief Request an authoritative external stop, stored unconditionally.
+    /// Request an authoritative external stop, stored unconditionally.
     ///
     /// The single source of truth for stopping a run. External stops win every race: they
     /// are published (inside the lifecycle lock, immediately before join) with a plain
@@ -583,7 +555,7 @@ impl Inner {
         self.stop_state.store(STOP_EXTERNAL, Ordering::Release);
     }
 
-    /// @brief Record a re-entrant self-stop from inside the run's own callback.
+    /// Record a re-entrant self-stop from inside the run's own callback.
     ///
     /// Only transitions `STOP_NONE -> me` via compare-exchange, so it never overwrites a
     /// pending external stop (which must win the join).
@@ -593,7 +565,7 @@ impl Inner {
             .compare_exchange(STOP_NONE, me, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    /// @brief Undo a re-entrant self-stop (self-start from inside the callback).
+    /// Undo a re-entrant self-stop (self-start from inside the callback).
     ///
     /// Compare-exchanges `me -> STOP_NONE`, clearing the stop only if this same thread
     /// still owns it. If an external stop landed in between, the CAS fails and that stop
@@ -604,19 +576,19 @@ impl Inner {
             .compare_exchange(me, STOP_NONE, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    /// @brief Clear the stop state back to running. Only ever called under the lifecycle
+    /// Clear the stop state back to running. Only ever called under the lifecycle
     /// lock (after join, before spawn), where no external stop can be in flight — the
     /// lost-stop invariant that lets this be an unconditional store.
     fn clear_stop(&self) {
         self.stop_state.store(STOP_NONE, Ordering::Release);
     }
 
-    /// @brief True once any stop (external or self) is pending; the hot loops poll this.
+    /// True once any stop (external or self) is pending; the hot loops poll this.
     fn stop_pending(&self) -> bool {
         self.stop_state.load(Ordering::Acquire) != STOP_NONE
     }
 
-    /// @brief True while a worker is (or is still becoming) live: the startup handshake
+    /// True while a worker is (or is still becoming) live: the startup handshake
     /// is in flight, or the hot loop is running with no stop pending.
     ///
     /// Goes false the moment the worker fails, is stopped, or dies mid-run — the hot loop
@@ -630,7 +602,7 @@ impl Inner {
         self.started_ok.load(Ordering::Acquire) && !self.stop_pending()
     }
 
-    /// @brief True when the calling thread is one of this run's own threads — the capture
+    /// True when the calling thread is one of this run's own threads — the capture
     /// worker or the delivery thread that runs the Python callback — i.e. the call is a
     /// re-entrant stop/start/drop from inside the callback. Such a caller must never
     /// join: teardown has the capture thread join the delivery thread, so a join from
@@ -641,7 +613,7 @@ impl Inner {
     }
 }
 
-/// @brief Per-`AudioCapture` shared handle: the lock-free `Inner` state plus the
+/// Per-`AudioCapture` shared handle: the lock-free `Inner` state plus the
 /// lifecycle-locked join handle for the capture thread.
 struct Shared {
     inner: Arc<Inner>,
@@ -649,15 +621,15 @@ struct Shared {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// @brief Process-wide registry of live captures, swept at interpreter exit. Holds `Weak`
+/// Process-wide registry of live captures, swept at interpreter exit. Holds `Weak`
 /// references so it keeps nothing alive on its own.
 static REGISTRY: OnceLock<Mutex<Vec<Weak<Shared>>>> = OnceLock::new();
-/// @brief Lazily initialize and return the capture registry.
+/// Lazily initialize and return the capture registry.
 fn registry() -> &'static Mutex<Vec<Weak<Shared>>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// @brief Locked takeover + spawn of a worker thread, shared by the capture and playback
+/// Locked takeover + spawn of a worker thread, shared by the capture and playback
 /// starts. Returns the new thread's id, or `None` if the spawn failed.
 ///
 /// Under the lifecycle lock, in order:
@@ -709,7 +681,7 @@ fn spawn_worker(
     }
 }
 
-/// @brief Failed-start teardown: stop and join the thread `spawned` by THIS start attempt,
+/// Failed-start teardown: stop and join the thread `spawned` by THIS start attempt,
 /// but only if it still owns the slot.
 ///
 /// A concurrent start may have already joined this thread and published a live replacement,
@@ -729,7 +701,7 @@ fn join_failed_start(slot: &Mutex<Option<JoinHandle<()>>>, inner: &Inner, spawne
     }
 }
 
-/// @brief Bounded, drop-oldest byte queue for the mic-PCM handoff into the virtual
+/// Bounded, drop-oldest byte queue for the mic-PCM handoff into the virtual
 /// "input" sink — the whole of the playback path's buffering in a single bound.
 ///
 /// `push` runs on the Python side with the GIL released; `drain_upto` runs on the
@@ -752,7 +724,7 @@ impl PlayQueue {
         }
     }
 
-    /// @brief Apply this run's byte bound and frame alignment, and drop any stale audio
+    /// Apply this run's byte bound and frame alignment, and drop any stale audio
     /// left from a prior run. `frame_bytes` is floored to 1 and the bound to `frame_bytes`.
     fn configure(&self, max_bytes: usize, frame_bytes: usize) {
         let fb = frame_bytes.max(1);
@@ -761,7 +733,7 @@ impl PlayQueue {
         self.buf.lock().unwrap().clear();
     }
 
-    /// @brief Append client PCM, dropping the OLDEST bytes once the queue passes the
+    /// Append client PCM, dropping the OLDEST bytes once the queue passes the
     /// byte bound so the newest audio is always retained.
     fn push(&self, data: &[u8]) {
         let max = self.max_bytes.load(Ordering::Relaxed);
@@ -772,7 +744,7 @@ impl PlayQueue {
         }
     }
 
-    /// @brief Drain up to `n` bytes into `out`, clamped to what is queued and floored to a
+    /// Drain up to `n` bytes into `out`, clamped to what is queued and floored to a
     /// whole frame, since a PA write must be a multiple of the sample-spec frame size.
     fn drain_upto(&self, n: usize, out: &mut Vec<u8>) {
         let fb = self.frame_bytes.load(Ordering::Relaxed);
@@ -784,7 +756,7 @@ impl PlayQueue {
     }
 }
 
-/// @brief Turns the mic uplink back into PCM: the client always sends the mic as Opus, so
+/// Turns the mic uplink back into PCM: the client always sends the mic as Opus, so
 /// every inbound packet must be decoded before it can be queued for the virtual sink. It
 /// decodes one packet to interleaved S16LE PCM, reusing a scratch buffer across calls to
 /// stay off the per-decode allocation path. Lives behind a `Mutex` on `PbShared` and is
@@ -800,7 +772,7 @@ struct OpusPlaybackDecoder {
 }
 
 impl OpusPlaybackDecoder {
-    /// @brief Create a mono/stereo Opus decoder for the mic uplink; `None` if creation
+    /// Create a mono/stereo Opus decoder for the mic uplink; `None` if creation
     /// fails. `channels <= 1` decodes as mono, otherwise stereo.
     fn new(sample_rate: u32, channels: i32) -> Option<Self> {
         let ch = if channels <= 1 { Channels::Mono } else { Channels::Stereo };
@@ -813,7 +785,7 @@ impl OpusPlaybackDecoder {
         })
     }
 
-    /// @brief Decode one Opus packet into interleaved S16LE PCM bytes, or `None` for an
+    /// Decode one Opus packet into interleaved S16LE PCM bytes, or `None` for an
     /// empty or undecodable packet.
     ///
     /// The scratch `pcm` buffer is grown once to `5760 * channels` — an Opus packet decodes
@@ -836,7 +808,7 @@ impl OpusPlaybackDecoder {
         Some(out)
     }
 
-    /// @brief Reconstruct the mic uplink across packet loss: recover any frames the sender
+    /// Reconstruct the mic uplink across packet loss: recover any frames the sender
     /// dropped from the redundant copies RED carries, and decode each new frame exactly once
     /// into `queue`. This is what lets a lossy UDP/WebRTC uplink play through gaps without ever
     /// waiting for a retransmit. It all runs off the GIL — the work is pure byte-slicing plus
@@ -919,7 +891,7 @@ impl OpusPlaybackDecoder {
     }
 }
 
-/// @brief Per-`AudioPlayback` shared handle — the mirror of `Shared` for the playback path.
+/// Per-`AudioPlayback` shared handle — the mirror of `Shared` for the playback path.
 ///
 /// Reuses the capture lifecycle core on `Inner` (the `stop_state` protocol, the start
 /// handshake, and the worker-tid re-entrancy guard); the Opus/silence settings mirrors on
@@ -933,15 +905,15 @@ struct PbShared {
     opus_dec: Mutex<Option<OpusPlaybackDecoder>>,
 }
 
-/// @brief Process-wide registry of live playbacks, swept by the same atexit sweep as
+/// Process-wide registry of live playbacks, swept by the same atexit sweep as
 /// captures. Holds `Weak` references so it keeps nothing alive on its own.
 static PLAYBACK_REGISTRY: OnceLock<Mutex<Vec<Weak<PbShared>>>> = OnceLock::new();
-/// @brief Lazily initialize and return the playback registry.
+/// Lazily initialize and return the playback registry.
 fn playback_registry() -> &'static Mutex<Vec<Weak<PbShared>>> {
     PLAYBACK_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// @brief Run one bounded iteration of a PulseAudio standard mainloop:
+/// Run one bounded iteration of a PulseAudio standard mainloop:
 /// `prepare(timeout_us)` → `poll` → `dispatch`. Returns `false` if any stage errors.
 ///
 /// The `timeout_us` bound is what makes a pending stop observable within ~20 ms even when
@@ -960,7 +932,7 @@ fn pump(ml: &mut pulse::mainloop::standard::Mainloop, timeout_us: u64) -> bool {
     true
 }
 
-/// @brief Chromium's multistream-Opus surround layout for a channel count, as
+/// Chromium's multistream-Opus surround layout for a channel count, as
 /// `(streams, coupled, mapping)`; `None` for anything but 5.1 (6) or 7.1 (8).
 ///
 /// The same tables are advertised in the WebRTC SDP (`multiopus`), so the browser's decoder
@@ -973,14 +945,14 @@ fn multiopus_layout(channels: i32) -> Option<(i32, i32, &'static [u8])> {
     }
 }
 
-/// @brief One encode surface over both Opus APIs: the `opus` crate for mono/stereo, and
+/// One encode surface over both Opus APIs: the `opus` crate for mono/stereo, and
 /// the raw multistream C API for 6/8-channel surround.
 enum PcmEncoder {
     Stereo(opus::Encoder),
     Multi(MultiOpus),
 }
 
-/// @brief Owning wrapper over a raw `OpusMSEncoder` (the surround multistream encoder).
+/// Owning wrapper over a raw `OpusMSEncoder` (the surround multistream encoder).
 ///
 /// The raw pointer is only ever touched from the capture thread that owns the enclosing
 /// `RunState`, which is what makes the `unsafe impl Send` below sound; `Drop` destroys the
@@ -998,7 +970,7 @@ impl Drop for MultiOpus {
 }
 
 impl PcmEncoder {
-    /// @brief Build the Opus encoder for a channel count, selecting the API by width.
+    /// Build the Opus encoder for a channel count, selecting the API by width.
     ///
     /// - **Mono/stereo** (`channels <= 2`): the safe `opus` crate encoder in `LowDelay`
     ///   application mode; a failure to apply the initial bitrate or VBR mode is logged but
@@ -1056,7 +1028,7 @@ impl PcmEncoder {
         }
     }
 
-    /// @brief Encode one interleaved-PCM frame into `out`, returning the packet byte length.
+    /// Encode one interleaved-PCM frame into `out`, returning the packet byte length.
     ///
     /// Dispatches to the `opus` crate (mono/stereo) or the raw multistream encode (surround,
     /// which needs the explicit `frame_size_per_channel`). Either error surfaces as a `String`.
@@ -1087,7 +1059,7 @@ impl PcmEncoder {
         }
     }
 
-    /// @brief Retune the encoder's target bitrate live (bits/s), for either API.
+    /// Retune the encoder's target bitrate live (bits/s), for either API.
     fn set_bitrate(&mut self, bits: i32) -> Result<(), String> {
         match self {
             PcmEncoder::Stereo(enc) => enc
@@ -1109,11 +1081,11 @@ impl PcmEncoder {
     }
 }
 
-/// @brief Backing store for the delivery ring: `Some(queue)` while open, `None` once closed
+/// Backing store for the delivery ring: `Some(queue)` while open, `None` once closed
 /// so `pop` wakes and returns `None` for a clean shutdown.
 type FrameQueue = Option<VecDeque<(Vec<u8>, u64)>>;
 
-/// @brief Bounded, drop-oldest hand-off from the capture thread to the Python delivery
+/// Bounded, drop-oldest hand-off from the capture thread to the Python delivery
 /// thread, so a slow or GIL-blocked callback can never stall the PulseAudio pump.
 ///
 /// The capture thread `push`es encoded `(frame, pts)` pairs; the delivery thread blocks in
@@ -1128,7 +1100,7 @@ struct DeliveryRing {
 }
 
 impl DeliveryRing {
-    /// @brief Create an open ring pre-sized to `capacity` frames.
+    /// Create an open ring pre-sized to `capacity` frames.
     fn new(capacity: usize) -> Self {
         Self {
             q: Mutex::new(Some(VecDeque::with_capacity(capacity))),
@@ -1138,7 +1110,7 @@ impl DeliveryRing {
         }
     }
 
-    /// @brief Enqueue one encoded frame, dropping the oldest (and bumping `dropped`) if the
+    /// Enqueue one encoded frame, dropping the oldest (and bumping `dropped`) if the
     /// ring is at capacity, then wake the consumer. A no-op once closed.
     fn push(&self, data: Vec<u8>, pts: u64) {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
@@ -1152,7 +1124,7 @@ impl DeliveryRing {
         }
     }
 
-    /// @brief Block until a frame is available and return it, or return `None` once the ring
+    /// Block until a frame is available and return it, or return `None` once the ring
     /// is closed and drained — the delivery thread's loop condition.
     fn pop(&self) -> Option<(Vec<u8>, u64)> {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
@@ -1169,7 +1141,7 @@ impl DeliveryRing {
         }
     }
 
-    /// @brief Close the ring: drop any queued frames and wake every waiter so `pop` returns
+    /// Close the ring: drop any queued frames and wake every waiter so `pop` returns
     /// `None`. Called during capture teardown to join the delivery thread.
     fn close(&self) {
         *self.q.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1177,7 +1149,7 @@ impl DeliveryRing {
     }
 }
 
-/// @brief Recycles outgoing frame buffers from dropped `AudioFrame`s back to the capture
+/// Recycles outgoing frame buffers from dropped `AudioFrame`s back to the capture
 /// thread, so the steady-state emit path allocates nothing.
 ///
 /// INVARIANT: every buffer is born as `vec![0u8; buf_size]`, so bytes `[0, buf_size)` stay
@@ -1189,17 +1161,17 @@ struct BufferPool {
 }
 
 impl BufferPool {
-    /// @brief Cap on pooled buffers. Outstanding frames rarely exceed the delivery-ring
+    /// Cap on pooled buffers. Outstanding frames rarely exceed the delivery-ring
     /// capacity plus a few Python-held references; anything past this goes back to the
     /// allocator rather than growing the pool unboundedly.
     const MAX_POOLED: usize = 16;
 
-    /// @brief Create an empty pool that hands out (and accepts) `buf_size`-byte buffers.
+    /// Create an empty pool that hands out (and accepts) `buf_size`-byte buffers.
     fn new(buf_size: usize) -> Self {
         Self { bufs: Mutex::new(Vec::new()), buf_size }
     }
 
-    /// @brief Take a fully initialized buffer of exactly `buf_size` length, recycling a
+    /// Take a fully initialized buffer of exactly `buf_size` length, recycling a
     /// pooled one when available. The runtime path takes through `PoolTaker`; this direct,
     /// locking form serves the unit tests.
     #[cfg(test)]
@@ -1211,7 +1183,7 @@ impl BufferPool {
         }
     }
 
-    /// @brief Restore a recycled buffer to full `buf_size` length via `set_len`.
+    /// Restore a recycled buffer to full `buf_size` length via `set_len`.
     ///
     /// Sound per the pool invariant: the bytes were written at allocation and truncation
     /// does not de-initialize them, so extending `len` back to `buf_size` never exposes
@@ -1222,7 +1194,7 @@ impl BufferPool {
         v
     }
 
-    /// @brief Return a buffer to the pool, unless it is undersized or the pool is already at
+    /// Return a buffer to the pool, unless it is undersized or the pool is already at
     /// `MAX_POOLED` (in which case it is dropped to the allocator).
     fn put(&self, v: Vec<u8>) {
         if v.capacity() < self.buf_size {
@@ -1234,7 +1206,7 @@ impl BufferPool {
         }
     }
 
-    /// @brief Move every pooled buffer into `into` under a single lock — the batched refill
+    /// Move every pooled buffer into `into` under a single lock — the batched refill
     /// for the sole-consumer `PoolTaker`, whose empty local stash is `into`.
     fn drain_into(&self, into: &mut Vec<Vec<u8>>) {
         let mut g = self.bufs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1242,7 +1214,7 @@ impl BufferPool {
     }
 }
 
-/// @brief Sole-consumer view over the shared `BufferPool` for the capture thread.
+/// Sole-consumer view over the shared `BufferPool` for the capture thread.
 ///
 /// Refills are batched into a `local` stash, so the per-frame `take` is lock-free in the
 /// steady state, while returns from the delivery/Python side (`AudioFrame` drops) still go
@@ -1253,12 +1225,12 @@ struct PoolTaker {
 }
 
 impl PoolTaker {
-    /// @brief Wrap a shared pool with an empty local stash.
+    /// Wrap a shared pool with an empty local stash.
     fn new(pool: Arc<BufferPool>) -> Self {
         Self { pool, local: Vec::new() }
     }
 
-    /// @brief Take one `buf_size` buffer: pop from the local stash, batch-refilling it from
+    /// Take one `buf_size` buffer: pop from the local stash, batch-refilling it from
     /// the shared pool (one lock) only when empty, and allocating fresh when both are empty.
     fn take(&mut self) -> Vec<u8> {
         if self.local.is_empty() {
@@ -1270,7 +1242,7 @@ impl PoolTaker {
         }
     }
 
-    /// @brief Return a buffer on an error path without locking — it stays in the local stash.
+    /// Return a buffer on an error path without locking — it stays in the local stash.
     fn put(&mut self, v: Vec<u8>) {
         if v.capacity() >= self.pool.buf_size && self.local.len() < BufferPool::MAX_POOLED {
             self.local.push(v);
@@ -1278,7 +1250,7 @@ impl PoolTaker {
     }
 }
 
-/// @brief Per-run encode/deliver state, living on the capture thread's stack for the
+/// Per-run encode/deliver state, living on the capture thread's stack for the
 /// lifetime of one capture. Holds the encoder, the frame-reassembly buffers, the outgoing
 /// buffer recycler, the RED redundancy history, and the running debug-log counters.
 struct RunState<'a> {
@@ -1312,7 +1284,7 @@ struct RunState<'a> {
 }
 
 impl<'a> RunState<'a> {
-    /// @brief Feed one PulseAudio PCM fragment into the reassembly buffer, emitting a frame
+    /// Feed one PulseAudio PCM fragment into the reassembly buffer, emitting a frame
     /// each time `accum` fills to exactly one Opus frame.
     ///
     /// Fragments arrive at arbitrary byte boundaries, so this copies from `src` into `accum`
@@ -1338,7 +1310,7 @@ impl<'a> RunState<'a> {
         }
     }
 
-    /// @brief Encode one reassembled frame and hand it to the delivery thread. The heart of
+    /// Encode one reassembled frame and hand it to the delivery thread. The heart of
     /// the capture encode path.
     ///
     /// 1. **Dynamic bitrate**: re-reads the `opus_bitrate` mirror and reconfigures the encoder
@@ -1435,7 +1407,7 @@ impl<'a> RunState<'a> {
     }
 }
 
-/// @brief Own one whole capture run end to end on a dedicated thread — connect PulseAudio,
+/// Own one whole capture run end to end on a dedicated thread — connect PulseAudio,
 /// encode, and deliver — until stopped. It runs on its own thread because the PulseAudio
 /// mainloop must be pumped continuously and independently of Python: sharing the caller's
 /// thread would tie capture cadence to the GIL and let any Python stall starve the audio.
@@ -1844,7 +1816,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     plog!("[pcmflux] Audio capture loop finished. Resources released.");
 }
 
-/// @brief Drive one whole mic-playback run on the playback thread. The body handed to
+/// Drive one whole mic-playback run on the playback thread. The body handed to
 /// `spawn_worker`; the mirror of `capture_run` for the uplink.
 ///
 /// This thread solely owns the PA playback stream, so writes are serialized structurally
@@ -2055,7 +2027,7 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     plog!("[pcmflux] Audio playback loop finished. Resources released.");
 }
 
-/// @brief Python-facing capture handle. Owns the `Shared` lifecycle state and exposes
+/// Python-facing capture handle. Owns the `Shared` lifecycle state and exposes
 /// `start_capture` / `stop_capture` / `update_audio_bitrate` / `is_capturing` to Python.
 #[pyclass]
 struct AudioCapture {
@@ -2080,7 +2052,7 @@ impl AudioCapture {
         }
     }
 
-    /// @brief Start (or restart) audio capture, delivering encoded frames to `callback`.
+    /// Start (or restart) audio capture, delivering encoded frames to `callback`.
     ///
     /// 1. **Re-entrancy guard**: if called on one of the run's own threads — the delivery
     ///    thread (where the Python callback actually executes) or the capture thread — it
@@ -2159,7 +2131,7 @@ impl AudioCapture {
         Ok(())
     }
 
-    /// @brief Stop audio capture, joining the capture thread.
+    /// Stop audio capture, joining the capture thread.
     ///
     /// A re-entrant stop from one of the run's own threads — the delivery thread (where the
     /// Python callback executes) or the capture thread — only records a self-stop: a join
@@ -2188,13 +2160,13 @@ impl AudioCapture {
         });
     }
 
-    /// @brief Set the live Opus target bitrate (bits/s) via the atomic mirror; the capture
+    /// Set the live Opus target bitrate (bits/s) via the atomic mirror; the capture
     /// loop applies it on the next frame, without a restart.
     fn update_audio_bitrate(&self, bps: i32) {
         self.inner().opus_bitrate.store(bps, Ordering::Relaxed);
     }
 
-    /// @brief True while a capture worker is running with no stop pending.
+    /// True while a capture worker is running with no stop pending.
     #[getter]
     fn is_capturing(&self) -> bool {
         let inner = self.inner();
@@ -2203,7 +2175,7 @@ impl AudioCapture {
 }
 
 impl Drop for AudioCapture {
-    /// @brief Best-effort stop on GC/dealloc: the re-entrant case (running on the run's own
+    /// Best-effort stop on GC/dealloc: the re-entrant case (running on the run's own
     /// delivery or capture thread) records a self-stop only (never clobbering a pending
     /// external stop); otherwise it takes the lifecycle lock and joins the capture thread
     /// with the GIL released, matching `stop_capture`.
@@ -2229,7 +2201,7 @@ impl Drop for AudioCapture {
     }
 }
 
-/// @brief Python-facing mic-playback handle, symmetric to `AudioCapture`.
+/// Python-facing mic-playback handle, symmetric to `AudioCapture`.
 ///
 /// Same lifecycle protocol, but a PA playback stream instead of a record stream, and a
 /// bounded drop-oldest queue fed by `write` / `write_red` instead of a Python callback.
@@ -2260,7 +2232,7 @@ impl AudioPlayback {
         }
     }
 
-    /// @brief Start (or restart) mic playback into the virtual sink. The playback mirror of
+    /// Start (or restart) mic playback into the virtual sink. The playback mirror of
     /// `start_capture`.
     ///
     /// Same shape as capture: a re-entrant start from the playback thread just undoes a
@@ -2336,7 +2308,7 @@ impl AudioPlayback {
         Ok(())
     }
 
-    /// @brief Push one Opus mic packet for playback. The steady-state hot path.
+    /// Push one Opus mic packet for playback. The steady-state hot path.
     ///
     /// Gated on `worker_alive`: it raises once no playback thread services the queue (start
     /// failure, stop, or a mid-run PA death), so the caller's reopen-on-error path engages
@@ -2363,7 +2335,7 @@ impl AudioPlayback {
         Ok(())
     }
 
-    /// @brief Play one RFC 2198 RED mic frame from the WebRTC/UDP uplink, recovering across any
+    /// Play one RFC 2198 RED mic frame from the WebRTC/UDP uplink, recovering across any
     /// packet loss on the way in. The lossy-transport counterpart of `write`.
     ///
     /// The payload is de-framed, loss-recovered, and decoded entirely off the GIL by
@@ -2386,7 +2358,7 @@ impl AudioPlayback {
         Ok(())
     }
 
-    /// @brief Stop mic playback, joining the playback thread.
+    /// Stop mic playback, joining the playback thread.
     ///
     /// A re-entrant stop from the playback thread records a self-stop only (it cannot
     /// self-join) and never clobbers an external stop already in effect. Otherwise it joins
@@ -2410,7 +2382,7 @@ impl AudioPlayback {
         });
     }
 
-    /// @brief True while a playback worker is running with no stop pending.
+    /// True while a playback worker is running with no stop pending.
     #[getter]
     fn is_running(&self) -> bool {
         let inner = self.inner();
@@ -2419,7 +2391,7 @@ impl AudioPlayback {
 }
 
 impl Drop for AudioPlayback {
-    /// @brief Best-effort stop on GC/dealloc; symmetric to `AudioCapture::drop`.
+    /// Best-effort stop on GC/dealloc; symmetric to `AudioCapture::drop`.
     fn drop(&mut self) {
         let inner = &self.shared.inner;
         let me = gettid();
@@ -2442,7 +2414,7 @@ impl Drop for AudioPlayback {
     }
 }
 
-/// @brief atexit sweep: stop and join every live capture and playback before interpreter
+/// atexit sweep: stop and join every live capture and playback before interpreter
 /// shutdown, so no worker thread is still calling into Python during finalization.
 ///
 /// Snapshots the two `Weak` registries into strong references (skipping any already
@@ -2487,7 +2459,7 @@ fn _stop_all_captures(py: Python<'_>) {
 mod tests {
     use super::*;
 
-    /// @brief The re-entrancy guard must recognize BOTH of a run's own threads: the
+    /// The re-entrancy guard must recognize BOTH of a run's own threads: the
     /// capture worker AND the delivery thread — the Python callback executes on the
     /// delivery thread, so a stop/start it issues arrives with the delivery tid, and
     /// treating it as external would join into the capture→delivery join cycle and
@@ -2504,7 +2476,7 @@ mod tests {
         assert!(inner.is_own_thread(me), "capture tid must still short-circuit the guard");
     }
 
-    /// @brief Encode 5.1 with a tone only on FC (input channel 2), decode with the same
+    /// Encode 5.1 with a tone only on FC (input channel 2), decode with the same
     /// layout, and verify the energy comes back on that same channel — proving the
     /// `multiopus_layout` tables are self-consistent end to end.
     #[test]
@@ -2565,7 +2537,7 @@ mod tests {
         }
     }
 
-    /// @brief `valid_opus_duration` accepts exactly the six legal Opus frame durations and
+    /// `valid_opus_duration` accepts exactly the six legal Opus frame durations and
     /// rejects everything else (including the near-misses 3, 15, 25, 30 ms).
     #[test]
     fn opus_durations() {
@@ -2577,7 +2549,7 @@ mod tests {
         }
     }
 
-    /// @brief The samples-per-channel and PCM-byte arithmetic matches the wire cases:
+    /// The samples-per-channel and PCM-byte arithmetic matches the wire cases:
     /// 48 kHz / 20 ms / stereo is 960 samples/ch and 3840 bytes, and 24 kHz / 10 ms / mono
     /// is 240 samples and 480 bytes.
     #[test]
@@ -2590,7 +2562,7 @@ mod tests {
         assert_eq!(m * 2, 480);
     }
 
-    /// @brief `red_distance == 0` produces exactly the 2-byte `[0x01, 0x00]` + opus framing,
+    /// `red_distance == 0` produces exactly the 2-byte `[0x01, 0x00]` + opus framing,
     /// and the omit-header path returns the raw opus with no prefix at all.
     #[test]
     fn red_zero_is_byte_identical() {
@@ -2606,7 +2578,7 @@ mod tests {
         assert_eq!(build_ws_body(&opus, 4096, &hist, 0, false), opus);
     }
 
-    /// @brief `red_distance == 2`: parse the emitted body back (`n_red` 4-byte headers, the
+    /// `red_distance == 2`: parse the emitted body back (`n_red` 4-byte headers, the
     /// 1-byte primary header, block datas split by their lengths) and assert the primary and
     /// the two redundant blocks round-trip with the expected oldest-first offsets 1920 & 960.
     #[test]
@@ -2652,7 +2624,7 @@ mod tests {
         assert_eq!(prim, &primary[..]);
     }
 
-    /// @brief Test helper: build an RFC 2198 RED payload — redundant blocks oldest-first,
+    /// Test helper: build an RFC 2198 RED payload — redundant blocks oldest-first,
     /// each with a 14-bit timestamp offset back from the primary, then the primary. Mirrors
     /// the wire format `decode_red_into_queue` parses (the mic-uplink counterpart of
     /// `build_ws_body`).
@@ -2673,7 +2645,7 @@ mod tests {
         v
     }
 
-    /// @brief Test helper: `n` distinct valid 20 ms mono Opus packets at 24 kHz
+    /// Test helper: `n` distinct valid 20 ms mono Opus packets at 24 kHz
     /// (480 samples/frame).
     fn opus_frames(n: usize) -> Vec<Vec<u8>> {
         let mut enc = opus::Encoder::new(24000, Channels::Mono, Application::LowDelay).unwrap();
@@ -2690,10 +2662,10 @@ mod tests {
             .collect()
     }
 
-    /// @brief Test constant: each decoded 20 ms mono frame is 480 samples * 2 bytes.
+    /// Test constant: each decoded 20 ms mono frame is 480 samples * 2 bytes.
     const FRAME_PCM_BYTES: usize = 480 * 2;
 
-    /// @brief A dropped middle packet is recovered from the next packet's redundancy: the
+    /// A dropped middle packet is recovered from the next packet's redundancy: the
     /// redundant copy of the gap frame is decoded, while the redundant copy of an
     /// already-played frame is not (timestamp dedup). Exercises the off-GIL RED playback path
     /// end to end — anchor on packet 1 (ts 1000), drop packet 2 (ts 1480), then packet 3
@@ -2716,7 +2688,7 @@ mod tests {
         assert_eq!(dec.last_ts, Some(1960));
     }
 
-    /// @brief With no loss, redundancy is pure overhead: every frame decodes exactly once and
+    /// With no loss, redundancy is pure overhead: every frame decodes exactly once and
     /// the redundant copies are dropped, so three packets yield exactly three frames.
     #[test]
     fn red_playback_no_double_decode() {
@@ -2735,7 +2707,7 @@ mod tests {
         assert_eq!(dec.last_ts, Some(1960));
     }
 
-    /// @brief A too-old block (offset > 16383, overflowing the 14-bit field) and an oversize
+    /// A too-old block (offset > 16383, overflowing the 14-bit field) and an oversize
     /// block (len > 1023, overflowing the 10-bit field) are both skipped, so `n_red` counts
     /// only the one in-range block that fit the RFC 2198 fields.
     #[test]
@@ -2765,7 +2737,7 @@ mod tests {
         assert_eq!(&body[11 + len..], &primary[..]);
     }
 
-    /// @brief `red_distance > 0` with no usable history (e.g. the first frame after a
+    /// `red_distance > 0` with no usable history (e.g. the first frame after a
     /// (re)start) collapses to exactly the 2-byte `[0x01, 0x00]` + opus framing — the same
     /// bytes as `n_red == 0`, not a primary-only RED header. The client's `n_red == 0` path
     /// strips exactly 2 bytes, so emitting a lone primary-only RED header here would be
@@ -2782,7 +2754,7 @@ mod tests {
         assert_eq!(body.len(), 2 + opus.len());
     }
 
-    /// @brief The all-zero comparison behind the silence gate: an all-zero buffer reads as
+    /// The all-zero comparison behind the silence gate: an all-zero buffer reads as
     /// silent, and a single non-zero sample makes it non-silent.
     #[test]
     fn silence_detection() {
@@ -2793,7 +2765,7 @@ mod tests {
         assert!(!not.iter().all(|&s| s == 0));
     }
 
-    /// @brief Deterministic lost-stop probe against the real `stop_state` protocol.
+    /// Deterministic lost-stop probe against the real `stop_state` protocol.
     ///
     /// A stand-in "capture thread" hammers `request_self_stop` + `undo_self_stop` (the
     /// re-entrant callback pattern) while another thread issues `request_external_stop` and
@@ -2833,7 +2805,7 @@ mod tests {
         }
     }
 
-    /// @brief Pushing past the byte bound drops the OLDEST bytes, keeping the newest window:
+    /// Pushing past the byte bound drops the OLDEST bytes, keeping the newest window:
     /// an 8-byte bound fed 12 bytes retains the last 8, and a second drain comes back empty.
     #[test]
     fn playqueue_drop_oldest_keeps_newest() {
@@ -2848,7 +2820,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// @brief `drain_upto` clamps to the requested count AND floors to a whole frame, so a PA
+    /// `drain_upto` clamps to the requested count AND floors to a whole frame, so a PA
     /// write never gets a partial frame: with 4-byte frames, a request of 7 yields 4 bytes,
     /// the next drain yields the next 4, and the trailing 2 bytes are withheld as a partial
     /// frame.
@@ -2866,7 +2838,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// @brief `configure()` applies the new bounds and drops stale audio from a prior run, so
+    /// `configure()` applies the new bounds and drops stale audio from a prior run, so
     /// bytes queued before it are gone afterward.
     #[test]
     fn playqueue_configure_resets() {
@@ -2878,7 +2850,7 @@ mod tests {
         assert!(out.is_empty(), "configure must clear stale audio");
     }
 
-    /// @brief `worker_alive` (which gates `AudioPlayback::write`) tracks the lifecycle: it is
+    /// `worker_alive` (which gates `AudioPlayback::write`) tracks the lifecycle: it is
     /// false before any worker, true through the startup handshake and the healthy run, and
     /// goes false the moment the hot loop's error exit clears `started_ok` — even with no stop
     /// pending and `start_state` still `RUNNING` (the silent mid-run death case). A pending
@@ -2904,7 +2876,7 @@ mod tests {
         assert!(!inner.worker_alive());
     }
 
-    /// @brief A LOSING start's failed-start cleanup must never tear down a WINNING start's
+    /// A LOSING start's failed-start cleanup must never tear down a WINNING start's
     /// freshly spawned thread.
     ///
     /// Drives the bad interleaving directly: loser L's worker fails, winner W takes the slot
@@ -2955,7 +2927,7 @@ mod tests {
         assert!(!inner.worker_alive());
     }
 
-    /// @brief Two threads race the full start sequence (`spawn_worker` + handshake poll +
+    /// Two threads race the full start sequence (`spawn_worker` + handshake poll +
     /// conditional failed-start cleanup), 200 times.
     ///
     /// `spawn_worker` joins the prior worker before spawning, so the bodies run in spawn
@@ -3025,7 +2997,7 @@ mod tests {
         }
     }
 
-    /// @brief The in-place `write_ws_prefix_into` + appended primary is byte-identical to the
+    /// The in-place `write_ws_prefix_into` + appended primary is byte-identical to the
     /// copy-based `build_ws_body` reference across the full matrix — empty vs mixed history
     /// (including one block aged out of the 14-bit offset at high pts and one oversized block
     /// that is always skipped), every `red_distance`, header on/off, and several pts values.
@@ -3053,7 +3025,7 @@ mod tests {
         }
     }
 
-    /// @brief A truncated buffer returned to the pool comes back as the same allocation
+    /// A truncated buffer returned to the pool comes back as the same allocation
     /// (recycled) restored to full `buf_size` length, and an undersized foreign buffer is
     /// rejected rather than pooled.
     #[test]
@@ -3071,7 +3043,7 @@ mod tests {
         assert_eq!(pool.take().len(), 64);
     }
 
-    /// @brief Dropping an `AudioFrame` whose `pool` is set returns its buffer to that pool,
+    /// Dropping an `AudioFrame` whose `pool` is set returns its buffer to that pool,
     /// so the next `take` hands back the same allocation.
     #[test]
     fn audio_frame_drop_refills_pool() {
@@ -3083,7 +3055,7 @@ mod tests {
         assert_eq!(recycled.as_ptr() as usize, ptr);
     }
 
-    /// @brief Micro-benchmark (not a correctness test) isolating the emit-path assembly cost:
+    /// Micro-benchmark (not a correctness test) isolating the emit-path assembly cost:
     /// the copy-based `build_ws_body` + per-frame alloc versus the pooled in-place prefix,
     /// with the encoder stubbed to a memcpy.
     ///
@@ -3136,7 +3108,7 @@ mod tests {
     }
 }
 
-/// @brief PyO3 module init: register the capture/playback classes and the atexit sweep.
+/// PyO3 module init: register the capture/playback classes and the atexit sweep.
 ///
 /// Exposes `AudioCapture`, `AudioCaptureSettings`, `AudioFrame`, `AudioPlayback`, and
 /// `AudioPlaybackSettings`, then registers `_stop_all_captures` on Python's `atexit` so no
