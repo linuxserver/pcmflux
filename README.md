@@ -24,8 +24,10 @@ sudo apt-get install libpulse-dev libopus-dev
 - **Native Audio Header:** With `omit_audio_header=False` (the default), the encoder prepends a 2-byte `[0x01, 0x00]` header to each chunk natively, so WebSocket transports avoid an extra Python copy. Set it to `True` for raw Opus (WebRTC/RTP).
 - **Optional RED redundancy (RFC 2198):** `red_distance` (0–4, default 0) prepends redundant copies of recent Opus payloads for lossy/unreliable transports; `0` disables it (the default for reliable WebSocket/TCP).
 - **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9–3.14)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
-- **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
-- **Live Bitrate Updates:** Thread-safe `update_bitrate()` (alias `update_audio_bitrate()`) adjusts the Opus bitrate during an active session.
+- **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
+- **Multichannel Opus:** Mono, stereo, and 5.1 / 7.1 surround (via the Opus multistream API with Chromium-compatible channel layouts); `channels` accepts 1, 2, 6, or 8.
+- **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo.
+- **Live Bitrate Updates:** Thread-safe `update_audio_bitrate()` adjusts the Opus bitrate during an active session.
 - **PyO3 Extension Module:** A native Rust `pcmflux` extension module (full CPython API, not Limited/abi3) provides PulseAudio capture + Opus encoding.
 - **Python Build System:** Uses `setuptools-rust` to build and package the `pcmflux` PyO3 extension.
 
@@ -53,18 +55,18 @@ def on_chunk(frame):
 
 settings = AudioCaptureSettings()
 settings.device_name = None      # None / "" => system default source
-settings.frame_duration_ms = 20  # one of 5/10/20/40/60
+settings.frame_duration_ms = 20  # one of 2.5/5/10/20/40/60
 
 capture = AudioCapture()
 capture.start_capture(settings, on_chunk)
-# capture.update_bitrate(96000)  # adjust the Opus bitrate while running
+# capture.update_audio_bitrate(96000)  # adjust the Opus bitrate while running
 # ...
 capture.stop_capture()
 ```
 
 ### API notes
 
-- `update_bitrate(bps)` / `update_audio_bitrate(bps)` store the new Opus bitrate
+- `update_audio_bitrate(bps)` stores the new Opus bitrate
   atomically; the capture thread re-reads it on the next frame, so it only takes
   effect during an **active** capture session. Calling it while no capture is
   active is **not** an error — it is a silent no-op store, but the value does
@@ -72,7 +74,7 @@ capture.stop_capture()
   snapshots the passed settings object and re-seeds the atomic bitrate mirror from
   `settings.opus_bitrate`. To change the bitrate for a new
   session, set `settings.opus_bitrate` before `start_capture()`; use
-  `update_bitrate()` only to adjust a session that is already running.
+  `update_audio_bitrate()` only to adjust a session that is already running.
 
 ## Example Usage
 
