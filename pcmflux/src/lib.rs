@@ -725,22 +725,29 @@ impl PlayQueue {
     }
 
     /// Apply this run's byte bound and frame alignment, and drop any stale audio
-    /// left from a prior run. `frame_bytes` is floored to 1 and the bound to `frame_bytes`.
+    /// left from a prior run. `frame_bytes` is floored to 1; the bound is floored
+    /// to a whole-frame multiple (min one frame) so overflow drops can never split
+    /// a sample frame.
     fn configure(&self, max_bytes: usize, frame_bytes: usize) {
         let fb = frame_bytes.max(1);
         self.frame_bytes.store(fb, Ordering::Relaxed);
-        self.max_bytes.store(max_bytes.max(fb), Ordering::Relaxed);
+        self.max_bytes.store((max_bytes / fb * fb).max(fb), Ordering::Relaxed);
         self.buf.lock().unwrap().clear();
     }
 
-    /// Append client PCM, dropping the OLDEST bytes once the queue passes the
-    /// byte bound so the newest audio is always retained.
+    /// Append client PCM, dropping the OLDEST whole frames once the queue passes
+    /// the byte bound so the newest audio is always retained. Drops stay
+    /// frame-aligned: trimming mid-frame would phase-shift every later drain into
+    /// interleaved garbage.
     fn push(&self, data: &[u8]) {
         let max = self.max_bytes.load(Ordering::Relaxed);
+        let fb = self.frame_bytes.load(Ordering::Relaxed);
         let mut q = self.buf.lock().unwrap();
         q.extend(data.iter().copied());
-        while q.len() > max {
-            q.pop_front();
+        let over = q.len().saturating_sub(max);
+        if over > 0 {
+            let drop = (over.div_ceil(fb) * fb).min(q.len());
+            q.drain(..drop);
         }
     }
 
@@ -2848,6 +2855,22 @@ mod tests {
         let mut out = Vec::new();
         q.drain_upto(100, &mut out);
         assert!(out.is_empty(), "configure must clear stale audio");
+    }
+
+    /// A byte bound that is not a whole-frame multiple must not let overflow drops
+    /// split a sample frame — a mid-frame trim would phase-shift every later drain
+    /// into interleaved garbage. The bound floors to whole frames and drops are made
+    /// in whole frames.
+    #[test]
+    fn playqueue_misaligned_bound_never_splits_frames() {
+        let q = PlayQueue::new();
+        q.configure(9, 4); // floors the bound to 8 = two 4-byte frames
+        q.push(&[0, 1, 2, 3]);
+        q.push(&[4, 5, 6, 7]);
+        q.push(&[8, 9, 10, 11]); // 12 queued, bound 8: exactly the oldest frame goes
+        let mut out = Vec::new();
+        q.drain_upto(100, &mut out);
+        assert_eq!(out, vec![4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     /// `worker_alive` (which gates `AudioPlayback::write`) tracks the lifecycle: it is

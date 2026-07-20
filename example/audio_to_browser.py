@@ -44,23 +44,21 @@ async def send_audio_chunks():
             # AudioFrame's native buffer) from the audio capture thread.
             opus_view = await g_audio_queue.get()
 
-            # If no clients are connected, just clear the queue item and wait.
-            if not g_clients:
-                opus_view.release()  # unpin: recycle the buffer to the pool
-                g_audio_queue.task_done()
-                continue
-
             # pcmflux prepends the 2-byte header [0x01, 0x00] natively
             # (omit_audio_header=False), so forward as-is (no per-frame Python copy).
             # Fire-and-forget fan-out: writes into each client's buffer without
             # awaiting per-connection backpressure, so one slow client can't
             # stall delivery to the others. Skips non-open connections.
-            # broadcast() serializes the frame before returning, so the view can
-            # be released as soon as it comes back.
-            ws_async.broadcast(g_clients, opus_view)
-            opus_view.release()
-
-            g_audio_queue.task_done()
+            # broadcast() serializes the frame before returning, so the view is
+            # released as soon as it comes back — in a finally, so a broadcast
+            # error can neither pin the pooled buffer nor skew the queue's
+            # unfinished-task accounting. With no clients the chunk just drains.
+            try:
+                if g_clients:
+                    ws_async.broadcast(g_clients, opus_view)
+            finally:
+                opus_view.release()  # unpin: recycle the buffer to the pool
+                g_audio_queue.task_done()
     except asyncio.CancelledError:
         print("Audio chunk broadcasting task cancelled.")
     finally:
@@ -167,8 +165,15 @@ def py_audio_callback(frame):
         # or raw Opus per settings) and keeps the frame alive via the buffer
         # protocol until the websocket send releases it.
         data_view = memoryview(frame)
-        if g_loop and not g_loop.is_closed():
-            g_loop.call_soon_threadsafe(_enqueue_audio, data_view)
+        try:
+            if g_loop and not g_loop.is_closed():
+                g_loop.call_soon_threadsafe(_enqueue_audio, data_view)
+            else:
+                data_view.release()
+        except RuntimeError:
+            # Loop closed between the check and the call (teardown race): the
+            # view was never handed off, so unpin the pooled buffer here.
+            data_view.release()
 
 def _enqueue_audio(data_view):
     """Enqueue one chunk on the loop thread, dropping the oldest if the bounded
