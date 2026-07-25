@@ -18,51 +18,55 @@ g_loop = None           # The main asyncio event loop.
 g_settings = None       # The audio capture configuration.
 g_callback = None       # The C-compatible callback function pointer.
 g_module = None         # The pcmflux.AudioCapture module instance.
-g_clients = set()       # A set of currently connected WebSocket clients.
+g_clients = {}          # ws -> {'queue': Queue, 'task': Task} per-client relay.
 g_is_capturing = False  # A flag to track the audio capture state.
-g_audio_queue = None    # A bounded asyncio.Queue for passing audio between threads.
-g_send_task = None      # The asyncio.Task that broadcasts audio to clients.
 g_status_task = None    # The asyncio.Task that periodically logs queue/drop stats.
-g_dropped = 0           # Audio frames dropped because the queue was full.
+g_dropped = 0           # Audio frames dropped because a client queue was full.
 # --- End Global Context ---
 
-# ~4s of 20ms frames; bounds memory if a client stalls and stops draining.
+# Delivery: the capture callback never blocks, each client has its own bounded
+# queue (~4s of 20ms frames), and a client that cannot drain the stream loses
+# the oldest frames, not the server's memory.
 AUDIO_QUEUE_MAXSIZE = 200
+# A send that makes no progress for this long marks the client abandoned; the
+# connection is closed rather than letting a dead socket linger (drops are
+# already handled upstream by the bounded queue).
+SEND_TIMEOUT_SECONDS = 1.0
 
-async def send_audio_chunks():
-    """
-    An asynchronous task that runs continuously to broadcast audio.
+async def send_audio_chunks(websocket, queue):
+    """Per-client sender: forwards this client's queue to its socket.
 
-    It retrieves encoded Opus audio chunks from the thread-safe queue and sends
-    them to all currently connected WebSocket clients concurrently.
+    Each queued item is a memoryview pinning one pooled native buffer, released
+    exactly once — after the send, on drop, or when this task drains the queue
+    on exit — so buffers always recycle promptly.
     """
-    global g_audio_queue, g_clients
-    print("Audio chunk broadcasting task started.")
     try:
         while True:
-            # Wait for an Opus chunk (a zero-copy memoryview pinning the
-            # AudioFrame's native buffer) from the audio capture thread.
-            opus_view = await g_audio_queue.get()
-
-            # pcmflux prepends the 2-byte header [0x01, 0x00] natively
-            # (omit_audio_header=False), so forward as-is (no per-frame Python copy).
-            # Fire-and-forget fan-out: writes into each client's buffer without
-            # awaiting per-connection backpressure, so one slow client can't
-            # stall delivery to the others. Skips non-open connections.
-            # broadcast() serializes the frame before returning, so the view is
-            # released as soon as it comes back — in a finally, so a broadcast
-            # error can neither pin the pooled buffer nor skew the queue's
-            # unfinished-task accounting. With no clients the chunk just drains.
+            view = await queue.get()
             try:
-                if g_clients:
-                    ws_async.broadcast(g_clients, opus_view)
+                await asyncio.wait_for(websocket.send(view),
+                                       SEND_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                print(f"Client {websocket.remote_address} abandoned (send "
+                      f"stalled > {SEND_TIMEOUT_SECONDS}s); closing.")
+                await websocket.close(code=1001, reason='Send timeout')
+                break
             finally:
-                opus_view.release()  # unpin: recycle the buffer to the pool
-                g_audio_queue.task_done()
+                view.release()
+                queue.task_done()
+    except websockets.exceptions.ConnectionClosed:
+        pass
     except asyncio.CancelledError:
-        print("Audio chunk broadcasting task cancelled.")
+        pass
     finally:
-        print("Audio chunk broadcasting task finished.")
+        # Unpin anything still queued so the pooled buffers recycle.
+        while True:
+            try:
+                leftover = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            leftover.release()
+            queue.task_done()
 
 async def status_logger():
     """Periodically logs queue depth and dropped-frame count so backpressure
@@ -70,9 +74,10 @@ async def status_logger():
     try:
         while True:
             await asyncio.sleep(5)
-            q = g_audio_queue
-            print(f"[server] queued={q.qsize() if q else 0}, "
-                  f"dropped={g_dropped}, clients={len(g_clients)}")
+            depths = [c['queue'].qsize() for c in g_clients.values()]
+            print(f"[server] clients={len(depths)}, "
+                  f"queued(max)={max(depths) if depths else 0}, "
+                  f"dropped={g_dropped}")
     except asyncio.CancelledError:
         pass
 
@@ -90,7 +95,7 @@ async def health_check(connection, request):
     # Allow all other requests to proceed to the WebSocket handler.
     return None
 
-async def ws_handler(websocket, path=None):
+async def ws_handler(websocket):
     """
     Handles the lifecycle of each WebSocket client connection.
 
@@ -98,24 +103,20 @@ async def ws_handler(websocket, path=None):
     client connects and stopping it when the last client disconnects, ensuring
     that system resources are only used when needed.
     """
-    global g_clients, g_is_capturing, g_audio_queue, g_module, g_send_task
-    global g_settings, g_callback, g_status_task
+    global g_is_capturing, g_status_task
 
-    # Register the new client.
-    g_clients.add(websocket)
+    # Register the new client with its own bounded relay.
+    client_queue = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
+    send_task = asyncio.create_task(send_audio_chunks(websocket, client_queue))
+    g_clients[websocket] = {'queue': client_queue, 'task': send_task}
     print(f"Client connected: {websocket.remote_address}. "
           f"Total clients: {len(g_clients)}")
 
     # If this is the first client, start the audio capture process.
     if not g_is_capturing and g_module:
         print("First client connected. Starting audio capture...")
-        g_audio_queue = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
         g_module.start_capture(g_settings, g_callback)
         g_is_capturing = True
-
-        # Ensure the broadcasting and status tasks are running.
-        if g_send_task is None or g_send_task.done():
-            g_send_task = asyncio.create_task(send_audio_chunks())
         if g_status_task is None or g_status_task.done():
             g_status_task = asyncio.create_task(status_logger())
         print("Audio capture process initiated.")
@@ -128,9 +129,15 @@ async def ws_handler(websocket, path=None):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        # Unregister the client upon disconnection.
-        if websocket in g_clients:
-            g_clients.remove(websocket)
+        # Unregister first so the fan-out stops targeting this client, then
+        # stop its sender (which drains and unpins any queued buffers).
+        g_clients.pop(websocket, None)
+        if not send_task.done():
+            send_task.cancel()
+            try:
+                await send_task
+            except asyncio.CancelledError:
+                pass
         print(f"Client disconnected. Remaining clients: {len(g_clients)}")
 
         # If this was the last client, stop the audio capture to save resources.
@@ -138,64 +145,50 @@ async def ws_handler(websocket, path=None):
             print("Last client disconnected. Stopping audio capture...")
             g_module.stop_capture()
             g_is_capturing = False
-            if g_send_task:
-                g_send_task.cancel()
-                g_send_task = None
             if g_status_task:
                 g_status_task.cancel()
                 g_status_task = None
-            g_audio_queue = None
             print("Audio capture process stopped.")
 
 def py_audio_callback(frame):
     """Per-chunk callback invoked from the native capture thread.
 
     `frame` is an AudioFrame that OWNS its encoded payload (buffer protocol +
-    `.pts`): a memoryview over it pins the frame — and therefore the native
-    buffer — alive until the view is released, so the chunk is handed to the
-    loop thread with no copy. Dropping the last reference recycles the buffer
-    back to the capture's pool. Silence-gated chunks are never delivered (the
-    callback is skipped for them), so `frame` always carries an encoded
-    payload — no empty-frame check is needed.
+    `.pts`): it is handed to the loop thread as-is, and the fan-out there makes
+    one memoryview per client, each pinning the frame — and therefore the
+    native buffer — alive until that client's send releases it. Dropping the
+    last reference recycles the buffer back to the capture's pool.
+    Silence-gated chunks are never delivered (the callback is skipped for
+    them), so `frame` always carries an encoded payload — no empty-frame check
+    is needed.
     """
-    global g_is_capturing, g_audio_queue, g_loop
-
-    if g_is_capturing and frame is not None and g_audio_queue is not None:
-        # Zero-copy: the view aliases the frame's native buffer (header+Opus,
-        # or raw Opus per settings) and keeps the frame alive via the buffer
-        # protocol until the websocket send releases it.
-        data_view = memoryview(frame)
+    if g_is_capturing and frame is not None:
         try:
             if g_loop and not g_loop.is_closed():
-                g_loop.call_soon_threadsafe(_enqueue_audio, data_view)
-            else:
-                data_view.release()
+                g_loop.call_soon_threadsafe(_fanout_audio, frame)
+            # Without a running loop the frame reference is simply dropped,
+            # which recycles the pooled buffer.
         except RuntimeError:
             # Loop closed between the check and the call (teardown race): the
-            # view was never handed off, so unpin the pooled buffer here.
-            data_view.release()
+            # frame was never handed off, so dropping it recycles the buffer.
+            pass
 
-def _enqueue_audio(data_view):
-    """Enqueue one chunk on the loop thread, dropping the oldest if the bounded
-    queue is full, so a stalled client can't grow memory without bound (each
-    queued view pins one pooled native buffer until it is sent or dropped)."""
+def _fanout_audio(frame):
+    """Fan one chunk out to every client's bounded queue on the loop thread,
+    dropping each stalled client's oldest frame first, so a slow consumer
+    costs bounded memory and never delays the others (each queued view pins
+    one pooled native buffer until it is sent or dropped)."""
     global g_dropped
-    q = g_audio_queue
-    if q is None:
-        data_view.release()  # queue torn down: unpin the native buffer now
-        return
-    if q.full():
-        try:
-            stale = q.get_nowait()
-            q.task_done()  # keep unfinished-task accounting balanced
+    for entry in g_clients.values():
+        queue = entry['queue']
+        # Loop-thread serialized with the senders: full()/get_nowait()/
+        # put_nowait() cannot race, so no defensive except is needed.
+        if queue.full():
+            stale = queue.get_nowait()
+            queue.task_done()
             stale.release()
             g_dropped += 1
-        except asyncio.QueueEmpty:
-            pass
-    try:
-        q.put_nowait(data_view)
-    except asyncio.QueueFull:
-        data_view.release()
+        queue.put_nowait(memoryview(frame))
 
 def _resolve_static_path(script_dir, request_path):
     """Return the real path of request_path under script_dir, or None if it
@@ -261,7 +254,7 @@ async def handle_http_request(reader, writer):
 
 async def main_async():
     """The main routine to initialize and run the servers."""
-    global g_loop, g_settings, g_callback, g_module
+    global g_loop, g_settings, g_callback, g_module, g_status_task
 
     g_loop = asyncio.get_running_loop()
 
@@ -304,36 +297,35 @@ async def main_async():
     print("HTTP server is serving files from current directory")
     print("-> Open http://localhost:9001/index.html in your browser.")
 
-    # Start the WebSocket server.
+    # Start the WebSocket server. Opus is already compressed, so
+    # permessage-deflate would only burn CPU and per-connection memory.
     ws_server = await ws_async.serve(
         ws_handler,
         'localhost',
         9000,
-        process_request=health_check
+        process_request=health_check,
+        compression=None
     )
     print("WebSocket server started on ws://localhost:9000")
 
-    global g_send_task, g_status_task
     try:
         # Keep the main coroutine running indefinitely.
         await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        pass
     finally:
-        # Stop capture first (joins the native capture thread, stops enqueuing), then cancel
-        # the consumer tasks, then close the servers.
+        # Stop capture first (joins the native capture thread, stops enqueuing),
+        # then close the client connections (each handler's finally block stops
+        # its sender), then close the servers.
         print("\nShutting down...")
         if g_module:
             g_module.stop_capture()
-        for task in (g_send_task, g_status_task):
-            if task:
-                task.cancel()
-        # Await the cancellations together; CancelledError is expected per task.
-        pending = [t for t in (g_send_task, g_status_task) if t]
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        g_send_task = None
-        g_status_task = None
+        close_tasks = [ws.close(code=1001, reason='Server shutting down')
+                       for ws in list(g_clients.keys())]
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        if g_status_task:
+            g_status_task.cancel()
+            await asyncio.gather(g_status_task, return_exceptions=True)
+            g_status_task = None
         for server in (ws_server, http_server):
             if server:
                 server.close()
