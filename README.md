@@ -1,6 +1,7 @@
 # pcmflux
 
 [![PyPI version](https://badge.fury.io/py/pcmflux.svg)](https://badge.fury.io/py/pcmflux)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://linuxserver.github.io/pcmflux/)
 
 pcmflux is a high-performance audio capture and encoding module for Python.
@@ -87,3 +88,8 @@ To run the example:
 3.  Open `http://localhost:9001` in a modern web browser (Chrome, Edge, etc.).
 
 The example client (`index.html`) strips the 2-byte `[0x01, 0x00]` header before decoding, and its `FRAME_DURATION_US` constant must match the server's `frame_duration_ms` (the value is not announced over the wire).
+
+## License
+
+This project is licensed under the **Mozilla Public License Version 2.0**.
+A copy of the MPL 2.0 can be found at https://mozilla.org/MPL/2.0/.
