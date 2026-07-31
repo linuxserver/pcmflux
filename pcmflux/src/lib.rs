@@ -50,6 +50,7 @@ use pulse::callbacks::ListResult;
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::def::BufferAttr;
 use pulse::sample::{Format, Spec};
+use pulse::mainloop::standard::Mainloop;
 use pulse::stream::{FlagSet as StreamFlags, PeekResult, Stream};
 use pulse::time::MicroSeconds;
 
@@ -669,7 +670,15 @@ fn spawn_worker(
             let _ = libc::setpriority(libc::PRIO_PROCESS, tid, -15);
         }
         t_inner.capture_tid.store(gettid(), Ordering::Release);
-        body();
+        // A worker panic must flip the liveness contract (started_ok/start_state):
+        // an unguarded unwind would leave is_capturing reporting true forever with
+        // no frames flowing and no error anywhere.
+        let p_inner = t_inner.clone();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+            elog!("[pcmflux] ERROR: worker thread panicked; marking the capture dead.");
+            p_inner.started_ok.store(false, Ordering::Release);
+            p_inner.start_state.store(ST_FAILED, Ordering::Release);
+        }
         t_inner.capture_tid.store(0, Ordering::Release);
     }) {
         Ok(h) => {
@@ -1447,6 +1456,152 @@ impl<'a> RunState<'a> {
 ///    `RunState`. A stop is observed within the pump bound even when the source is wedged. On
 ///    exit it disconnects the stream, drops the encoder, closes and joins the delivery ring,
 ///    and reports any dropped stale frames.
+/// One PulseAudio session for capture: mainloop, context, and the record stream,
+/// all recreated together on reconnect.
+/// Drop order matters (declaration order): the stream must die first, then its
+/// owning context, then the mainloop both pulse threads pump — the reverse of
+/// the build. A wrong order is a use-after-free on the libpulse side.
+struct PaCaptureSession {
+    stream: Stream,
+    /// Must outlive the stream (the connection owns it); never read after open.
+    #[allow(dead_code)]
+    context: Context,
+    mainloop: Mainloop,
+}
+
+/// Why a session failed to open: drives the retry policy of the caller.
+enum SessionOpenError {
+    /// The named source is absent (misconfiguration-ish); starts fail fast on this.
+    DeviceNotFound(String),
+    /// Server down, busy, or a bring-up race: retryable.
+    Transient(String),
+    /// stop_pending observed while opening; caller must shut down cleanly.
+    Aborted,
+}
+
+/// Open a capture session: mainloop + context + record stream driven to `Ready` on the
+/// bounded pump, honoring `stop_pending` at every turn. A NAMED device is validated by
+/// an introspect probe on every call (an async connect_record would not fail
+/// synchronously on a bad name, and on reconnect this is also what notices the device
+/// reappearing after an outage). `device_was_present` distinguishes initial bring-up
+/// from reconnect: a named device missing at startup is a misconfiguration worth
+/// failing fast on; the same device vanishing mid-run (PulseAudio/PipeWire restart
+/// kills every source) is transient and must be retried or audio never comes back.
+fn pa_capture_session_open(
+    inner: &Inner,
+    spec: &Spec,
+    device: Option<&str>,
+    attr: &BufferAttr,
+    adjust_latency: bool,
+    device_was_present: bool,
+) -> Result<PaCaptureSession, SessionOpenError> {
+    let tr = |e: &str| SessionOpenError::Transient(e.to_string());
+    let mut mainloop = match Mainloop::new() {
+        Some(m) => m,
+        None => return Err(tr("pa_mainloop_new() failed")),
+    };
+    let mut context = match Context::new(&mainloop, "pcmflux") {
+        Some(c) => c,
+        None => return Err(tr("pa_context_new() failed")),
+    };
+    if context.connect(None, CtxFlags::NOFLAGS, None).is_err() {
+        return Err(tr("pa_context_connect() failed"));
+    }
+    loop {
+        let st = context.get_state();
+        if st == pulse::context::State::Ready {
+            break;
+        }
+        if !st.is_good() {
+            return Err(tr("PulseAudio context connection failed"));
+        }
+        if inner.stop_pending() {
+            return Err(SessionOpenError::Aborted);
+        }
+        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
+            return Err(tr("mainloop iterate failed during connect"));
+        }
+    }
+
+    if let Some(dev) = device {
+        let probe = Arc::new(Mutex::new((false, false)));
+        let p2 = probe.clone();
+        let op = context.introspect().get_source_info_by_name(dev, move |res| {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut g = p2.lock().unwrap();
+                match res {
+                    ListResult::Item(_) => g.0 = true,
+                    ListResult::End | ListResult::Error => g.1 = true,
+                }
+            }));
+        });
+        loop {
+            if probe.lock().unwrap().1 {
+                break;
+            }
+            if inner.stop_pending() {
+                drop(op);
+                return Err(SessionOpenError::Aborted);
+            }
+            if !context.get_state().is_good() {
+                drop(op);
+                return Err(tr("context failed during source probe"));
+            }
+            if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
+                drop(op);
+                return Err(tr("mainloop iterate failed during source probe"));
+            }
+        }
+        drop(op);
+        if !probe.lock().unwrap().0 {
+            let msg = format!("PulseAudio source not found: '{dev}'");
+            return Err(if device_was_present {
+                // Mid-run: the server was just restarted; its sources are all
+                // gone for now, not misconfigured.
+                SessionOpenError::Transient(msg)
+            } else {
+                SessionOpenError::DeviceNotFound(msg)
+            });
+        }
+    }
+
+    let mut stream = match Stream::new(&mut context, "Audio Capture", spec, None) {
+        Some(s) => s,
+        None => return Err(tr("pa_stream_new() failed")),
+    };
+    let flags = if adjust_latency {
+        StreamFlags::ADJUST_LATENCY
+    } else {
+        StreamFlags::NOFLAGS
+    };
+    if stream.connect_record(device, Some(attr), flags).is_err() {
+        return Err(tr("pa_stream_connect_record() failed"));
+    }
+    loop {
+        let st = stream.get_state();
+        if st == pulse::stream::State::Ready {
+            break;
+        }
+        if !st.is_good() {
+            return Err(SessionOpenError::Transient(format!(
+                "PulseAudio record stream failed (device '{}')",
+                device.unwrap_or("default")
+            )));
+        }
+        if inner.stop_pending() {
+            return Err(SessionOpenError::Aborted);
+        }
+        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
+            return Err(tr("mainloop iterate failed during stream connect"));
+        }
+    }
+    Ok(PaCaptureSession {
+        stream,
+        context,
+        mainloop,
+    })
+}
+
 fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     inner.opus_bitrate.store(settings.opus_bitrate, Ordering::Relaxed);
     inner.use_silence_gate.store(settings.use_silence_gate, Ordering::Relaxed);
@@ -1502,103 +1657,6 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     }
 
     let device = settings.device_name.as_deref();
-    plog!(
-        "[pcmflux] Attempting to connect to PulseAudio device: {} ({})",
-        device.unwrap_or("system_default"),
-        if adjust_latency {
-            format!("latency {}ms", settings.latency_ms)
-        } else {
-            "default latency".to_string()
-        }
-    );
-
-    let mut mainloop = match pulse::mainloop::standard::Mainloop::new() {
-        Some(m) => m,
-        None => {
-            elog!("[pcmflux] ERROR: pa_mainloop_new() failed.");
-            fail();
-            return;
-        }
-    };
-    let mut context = match Context::new(&mainloop, "pcmflux") {
-        Some(c) => c,
-        None => {
-            elog!("[pcmflux] ERROR: pa_context_new() failed.");
-            fail();
-            return;
-        }
-    };
-    if context.connect(None, CtxFlags::NOFLAGS, None).is_err() {
-        elog!("[pcmflux] ERROR: pa_context_connect() failed.");
-        fail();
-        return;
-    }
-
-    loop {
-        let st = context.get_state();
-        if st == pulse::context::State::Ready {
-            break;
-        }
-        if !st.is_good() {
-            elog!("[pcmflux] ERROR: PulseAudio context connection failed.");
-            fail();
-            return;
-        }
-        if inner.stop_pending() {
-            elog!("[pcmflux] audio capture start aborted: stop during startup (context).");
-            fail();
-            return;
-        }
-        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            elog!("[pcmflux] ERROR: mainloop iterate failed during connect.");
-            fail();
-            return;
-        }
-    }
-    plog!("[pcmflux] SUCCESS: Connected to PulseAudio.");
-
-    if let Some(dev) = device {
-        let probe = Arc::new(Mutex::new((false, false)));
-        let p2 = probe.clone();
-        let op = context.introspect().get_source_info_by_name(dev, move |res| {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut g = p2.lock().unwrap();
-                match res {
-                    ListResult::Item(_) => g.0 = true,
-                    ListResult::End | ListResult::Error => g.1 = true,
-                }
-            }));
-        });
-        loop {
-            if probe.lock().unwrap().1 {
-                break;
-            }
-            if inner.stop_pending() {
-                elog!("[pcmflux] audio capture start aborted: stop during source probe.");
-                drop(op);
-                fail();
-                return;
-            }
-            if !context.get_state().is_good() {
-                elog!("[pcmflux] ERROR: context failed during source probe.");
-                drop(op);
-                fail();
-                return;
-            }
-            if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-                elog!("[pcmflux] ERROR: mainloop iterate failed during source probe.");
-                drop(op);
-                fail();
-                return;
-            }
-        }
-        drop(op);
-        if !probe.lock().unwrap().0 {
-            elog!("[pcmflux] ERROR: PulseAudio source not found: '{dev}'");
-            fail();
-            return;
-        }
-    }
 
     let encoder = match PcmEncoder::new(
         settings.sample_rate,
@@ -1618,64 +1676,6 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     let frame_size_per_channel =
         (settings.sample_rate as f64 * settings.frame_duration_ms / 1000.0) as usize;
     let channels = settings.channels as usize;
-
-    let mut stream = match Stream::new(&mut context, "Audio Capture", &spec, None) {
-        Some(s) => s,
-        None => {
-            elog!("[pcmflux] ERROR: pa_stream_new() failed.");
-            fail();
-            return;
-        }
-    };
-    let flags = if adjust_latency {
-        StreamFlags::ADJUST_LATENCY
-    } else {
-        StreamFlags::NOFLAGS
-    };
-    if stream.connect_record(device, Some(&attr), flags).is_err() {
-        elog!(
-            "[pcmflux] ERROR: pa_stream_connect_record() failed (device '{}').",
-            device.unwrap_or("default")
-        );
-        fail();
-        return;
-    }
-
-    loop {
-        let st = stream.get_state();
-        if st == pulse::stream::State::Ready {
-            break;
-        }
-        if !st.is_good() {
-            elog!(
-                "[pcmflux] ERROR: PulseAudio record stream failed (device '{}').",
-                device.unwrap_or("default")
-            );
-            fail();
-            return;
-        }
-        if inner.stop_pending() {
-            elog!("[pcmflux] audio capture start aborted: stop during stream connect.");
-            fail();
-            return;
-        }
-        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            elog!("[pcmflux] ERROR: mainloop iterate failed during stream connect.");
-            fail();
-            return;
-        }
-    }
-
-    plog!(
-        "[pcmflux] Capture loop started. Device: {}, Rate: {}, Channels: {}, Bitrate: {} kbps, \
-         VBR: {}, Silence Gate: {}",
-        device.unwrap_or("system_default"),
-        settings.sample_rate,
-        settings.channels,
-        settings.opus_bitrate / 1000,
-        if settings.use_vbr { "On" } else { "Off" },
-        if settings.use_silence_gate { "On" } else { "Off" }
-    );
 
     let ring = Arc::new(DeliveryRing::new(8));
     let max_pkt = if settings.channels > 2 { 4 * MAX_OPUS_PACKET } else { MAX_OPUS_PACKET };
@@ -1740,28 +1740,94 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         bytes_encoded: 0,
     };
 
-    inner.started_ok.store(true, Ordering::Release);
-    inner.start_state.store(ST_RUNNING, Ordering::Release);
-
     let mut last_log = Instant::now();
 
-    while !inner.stop_pending() {
-        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            elog!("[pcmflux] ERROR: mainloop iterate failed; stopping capture.");
-            inner.started_ok.store(false, Ordering::Release);
+    // Session loop: the record stream CAN die mid-run (PulseAudio/PipeWire restart,
+    // source unplugged) and a plain `break` there leaves audio dead until some
+    // unrelated settings change restarts the capture. Reopen with backoff instead:
+    // startup gets a short window (bring-up races), steady-state reconnects a longer
+    // one; an absent NAMED source always fails fast (misconfiguration).
+    const START_TRIES: u32 = 12;
+    const RECONNECT_TRIES: u32 = 40;
+    let mut session: Option<PaCaptureSession> = None;
+    let mut ever_connected = false;
+    let mut tries: u32 = 0;
+    let mut backoff_ms: u64 = 250;
+    let mut terminal_error: Option<String> = None;
+
+    loop {
+        if inner.stop_pending() {
             break;
         }
-        let sstate = stream.get_state();
+        if session.is_none() {
+            match pa_capture_session_open(inner, &spec, device, &attr, adjust_latency, ever_connected) {
+                Ok(s) => {
+                    session = Some(s);
+                    tries = 0;
+                    backoff_ms = 250;
+                    if !ever_connected {
+                        ever_connected = true;
+                        inner.started_ok.store(true, Ordering::Release);
+                        inner.start_state.store(ST_RUNNING, Ordering::Release);
+                        plog!(
+                            "[pcmflux] Capture loop started. Device: {}, Rate: {}, Channels: {}, Bitrate: {} kbps, \
+                             VBR: {}, Silence Gate: {}",
+                            device.unwrap_or("system_default"),
+                            settings.sample_rate,
+                            settings.channels,
+                            settings.opus_bitrate / 1000,
+                            if settings.use_vbr {
+                                "On"
+                            } else {
+                                "Off"
+                            },
+                            if settings.use_silence_gate { "On" } else { "Off" }
+                        );
+                    } else {
+                        plog!("[pcmflux] audio capture reconnected; resuming.");
+                    }
+                }
+                Err(SessionOpenError::Aborted) => break,
+                Err(SessionOpenError::DeviceNotFound(e)) => {
+                    elog!("[pcmflux] ERROR: {e}");
+                    terminal_error = Some(e);
+                    break;
+                }
+                Err(SessionOpenError::Transient(e)) => {
+                    tries += 1;
+                    let cap = if ever_connected { RECONNECT_TRIES } else { START_TRIES };
+                    if tries >= cap {
+                        terminal_error = Some(e);
+                        break;
+                    }
+                    elog!("[pcmflux] audio capture open failed ({e}); retry {tries}/{cap} in {backoff_ms}ms");
+                    let mut slept = 0u64;
+                    while slept < backoff_ms && !inner.stop_pending() {
+                        std::thread::sleep(Duration::from_millis(50));
+                        slept += 50;
+                    }
+                    backoff_ms = (backoff_ms * 2).min(5000);
+                    continue;
+                }
+            }
+        }
+        let s = session.as_mut().expect("session checked above");
+        if !pump(&mut s.mainloop, PUMP_TIMEOUT_US) {
+            elog!("[pcmflux] ERROR: mainloop iterate failed; reopening the session.");
+            session = None;
+            continue;
+        }
+        let sstate = s.stream.get_state();
         if sstate != pulse::stream::State::Ready {
-            elog!("[pcmflux] ERROR: record stream entered a non-ready state; stopping.");
-            inner.started_ok.store(false, Ordering::Release);
-            break;
+            elog!("[pcmflux] record stream lost; reopening the session.");
+            session = None;
+            continue;
         }
 
         loop {
             let mut discard = false;
             let mut done = false;
-            match stream.peek() {
+            match s.stream.peek() {
                 Ok(PeekResult::Empty) => done = true,
                 Ok(PeekResult::Hole(_)) => discard = true,
                 Ok(PeekResult::Data(buf)) => {
@@ -1774,7 +1840,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
                 }
             }
             if discard {
-                let _ = stream.discard();
+                let _ = s.stream.discard();
             }
             if done {
                 break;
@@ -1804,9 +1870,18 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         }
     }
 
-    plog!("[pcmflux] Stop requested. Cleaning up capture loop...");
-    inner.started_ok.store(false, Ordering::Release);
-    let _ = stream.disconnect();
+    if let Some(e) = terminal_error {
+        elog!("[pcmflux] ERROR: audio capture could not stay connected (last error: {e}); stopping.");
+        inner.started_ok.store(false, Ordering::Release);
+        inner.start_state.store(ST_FAILED, Ordering::Release);
+    } else {
+        plog!("[pcmflux] Stop requested. Cleaning up capture loop...");
+        inner.started_ok.store(false, Ordering::Release);
+    }
+    if let Some(s) = session.as_mut() {
+        let _ = s.stream.disconnect();
+    }
+    drop(session);
     drop(run);
     ring.close();
     if let Some(j) = deliver_join {
@@ -1817,11 +1892,9 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     if dropped > 0 {
         plog!("[pcmflux] Delivery ring dropped {dropped} stale frame(s) to a slow consumer.");
     }
-    drop(stream);
-    drop(context);
-    drop(mainloop);
     plog!("[pcmflux] Audio capture loop finished. Resources released.");
 }
+
 
 /// Drive one whole mic-playback run on the playback thread. The body handed to
 /// `spawn_worker`; the mirror of `capture_run` for the uplink.
