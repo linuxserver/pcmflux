@@ -896,7 +896,11 @@ impl OpusPlaybackDecoder {
         }
         let mut last = self.last_ts.unwrap();
         for &(ts, start, len) in frames.iter().take(nf) {
-            if len > 0 && ts > last {
+            // RTP timestamps are 32-bit and wrap; compare serial-number style so a
+            // wraparound isn't mistaken for "already played" (ts > last would fail
+            // for every frame after the rollover).
+            let newer = ((ts.wrapping_sub(last)) as i32) > 0;
+            if len > 0 && newer {
                 if let Some(pcm) = self.decode_to_pcm(&payload[start..start + len]) {
                     queue.push(&pcm);
                 }
@@ -1351,8 +1355,7 @@ impl<'a> RunState<'a> {
         self.chunks_read += 1;
 
         let requested = self.inner.opus_bitrate.load(Ordering::Relaxed);
-        if requested != self.last_requested_bitrate {
-            self.last_requested_bitrate = requested;
+        if requested != self.current_applied_bitrate {
             match self.encoder.set_bitrate(requested) {
                 Ok(()) => {
                     plog!(
@@ -1361,8 +1364,11 @@ impl<'a> RunState<'a> {
                         requested / 1000
                     );
                     self.current_applied_bitrate = requested;
+                    self.last_requested_bitrate = requested;
                 }
                 Err(e) => {
+                    // Keep last_requested_bitrate stale so a rejected value is retried
+                    // instead of being latched as if it had been applied.
                     elog!("[pcmflux] Failed to update bitrate ({requested}): {e:?}");
                 }
             }
@@ -1375,6 +1381,10 @@ impl<'a> RunState<'a> {
             && self.accum == self.silence_ref
         {
             self.chunks_silent += 1;
+            // Flush the RED backlog: if these pre-silence frames were kept, the first
+            // packet after a long quiet stretch would ship minutes-old audio as
+            // "redundant" data, and a receiver could reconstruct it into the gap.
+            self.red_history.clear();
             return;
         }
         if !self.first_sound_detected {
@@ -2241,9 +2251,11 @@ impl AudioCapture {
     }
 
     /// Set the live Opus target bitrate (bits/s) via the atomic mirror; the capture
-    /// loop applies it on the next frame, without a restart.
+    /// loop applies it on the next frame, without a restart. Values are clamped to the
+    /// valid Opus range so an out-of-range request can never wedge the encoder.
     fn update_audio_bitrate(&self, bps: i32) {
-        self.inner().opus_bitrate.store(bps, Ordering::Relaxed);
+        let clamped = bps.clamp(6000, 510000);
+        self.inner().opus_bitrate.store(clamped, Ordering::Relaxed);
     }
 
     /// True while a capture worker is running with no stop pending.
@@ -2538,6 +2550,26 @@ fn _stop_all_captures(py: Python<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Timestamps that wrap the 32-bit RTP range still decode in order — the
+    /// post-rollover frame is not mistaken for an already-played duplicate.
+    #[test]
+    fn red_playback_timestamp_wraparound() {
+        let f = opus_frames(3);
+        let mut dec = OpusPlaybackDecoder::new(24000, 1).unwrap();
+        let q = PlayQueue::new();
+        q.configure(1 << 20, 2);
+        let wrap = (u32::MAX as i64) - 100;
+        dec.decode_red_into_queue(&build_red_payload(&[], &f[0]), wrap, &q);
+        // One 20 ms step past the 32-bit rollover (mod 2^32): ts is numerically far
+        // BELOW `wrap`, so a plain `ts > last` treats it as an already-played frame.
+        let next = (wrap.wrapping_add(480)) & 0xFFFF_FFFF;
+        dec.decode_red_into_queue(&build_red_payload(&[(480, &f[0])], &f[1]), next, &q);
+        let mut out = Vec::new();
+        q.drain_upto(1 << 20, &mut out);
+        assert_eq!(out.len(), 2 * FRAME_PCM_BYTES,
+            "frame after the 32-bit wrap was dropped as a duplicate");
+    }
 
     /// The re-entrancy guard must recognize BOTH of a run's own threads: the
     /// capture worker AND the delivery thread — the Python callback executes on the
