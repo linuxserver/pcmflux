@@ -17,6 +17,8 @@ On Debian/Ubuntu, you can install them with:
 sudo apt-get install libpulse-dev libopus-dev
 ```
 
+If the system `libopus` is not found, the build falls back to compiling a bundled copy of opus via `cmake`; in that case `cmake` and a C compiler (`build-essential`) are additionally required.
+
 ## Core Features
 
 - **PulseAudio Capture:** Captures system audio via PulseAudio using the asynchronous `Context`/`Stream` record API with a manually-pumped mainloop.
