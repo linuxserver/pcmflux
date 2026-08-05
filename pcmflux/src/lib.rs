@@ -504,9 +504,10 @@ impl AudioFrame {
 /// "should this run stop") and `start_state` (the STARTING → RUNNING/FAILED startup
 /// handshake) — plus `capture_tid` and `deliver_tid`, the worker and delivery threads'
 /// OS tids used to detect a re-entrant stop/start issued from inside the Python callback
-/// (which runs on the delivery thread). The remaining atomics mirror
-/// settings the worker consults each frame, so `update_audio_bitrate` and the silence /
-/// header flags can change mid-run without locking or re-snapshotting `Settings`.
+/// (which runs on the delivery thread). The remaining atomics mirror settings the worker
+/// consults each frame without re-snapshotting `Settings`, so `update_audio_bitrate` can
+/// retune the encoder mid-run without locking; the silence and header flags are published
+/// once at start and only read per frame.
 struct Inner {
     /// Single lifecycle source of truth: `STOP_NONE` (running), `STOP_EXTERNAL`, or a
     /// positive tid meaning the run self-stopped from inside its own callback (recorded
@@ -523,8 +524,9 @@ struct Inner {
     /// because a stop/start issued from inside the callback executes on THIS thread — a
     /// join from it would cycle (stopper joins capture, capture joins delivery).
     deliver_tid: AtomicI64,
-    /// Lock-free per-frame settings mirrors, published by start / `update_bitrate` and
-    /// re-read by the worker each frame.
+    /// Lock-free per-frame settings mirrors, re-read by the worker each frame.
+    /// `opus_bitrate` is republished by `update_audio_bitrate`; the rest are published
+    /// once, by the run that starts.
     opus_bitrate: AtomicI32,
     use_silence_gate: AtomicBool,
     debug_logging: AtomicBool,
@@ -741,6 +743,12 @@ impl PlayQueue {
         let fb = frame_bytes.max(1);
         self.frame_bytes.store(fb, Ordering::Relaxed);
         self.max_bytes.store((max_bytes / fb * fb).max(fb), Ordering::Relaxed);
+        self.clear();
+    }
+
+    /// Drop everything queued, keeping the bounds. Used when a run starts and whenever the
+    /// playback session is reopened, since audio buffered across an outage is stale.
+    fn clear(&self) {
         self.buf.lock().unwrap().clear();
     }
 
@@ -801,13 +809,16 @@ impl OpusPlaybackDecoder {
         })
     }
 
-    /// Decode one Opus packet into interleaved S16LE PCM bytes, or `None` for an
-    /// empty or undecodable packet.
+    /// Decode one Opus packet and return the interleaved S16LE PCM as bytes, or `None`
+    /// for an empty or undecodable packet.
     ///
     /// The scratch `pcm` buffer is grown once to `5760 * channels` — an Opus packet decodes
     /// to at most 120 ms, which is 5760 samples per channel at 48 kHz — then reused across
-    /// calls. The decoded samples are serialized little-endian into a fresh `Vec<u8>`.
-    fn decode_to_pcm(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+    /// calls, and the result is a view straight over it, so a decode never allocates. The
+    /// view borrows the decoder, so callers must queue it before decoding the next packet.
+    /// Reinterpreting the samples as S16LE bytes assumes a little-endian host, exactly as
+    /// the capture side does when it fills `accum` from PulseAudio fragments.
+    fn decode_to_pcm(&mut self, packet: &[u8]) -> Option<&[u8]> {
         if packet.is_empty() {
             return None;
         }
@@ -817,11 +828,7 @@ impl OpusPlaybackDecoder {
         }
         let samples = self.dec.decode(packet, &mut self.pcm[..cap], false).ok()?;
         let n = samples * self.channels;
-        let mut out = Vec::with_capacity(n * 2);
-        for &s in &self.pcm[..n] {
-            out.extend_from_slice(&s.to_le_bytes());
-        }
-        Some(out)
+        Some(bytemuck::cast_slice(&self.pcm[..n]))
     }
 
     /// Reconstruct the mic uplink across packet loss: recover any frames the sender
@@ -888,7 +895,7 @@ impl OpusPlaybackDecoder {
             let (ts, start, len) = frames[nf - 1];
             if len > 0 {
                 if let Some(pcm) = self.decode_to_pcm(&payload[start..start + len]) {
-                    queue.push(&pcm);
+                    queue.push(pcm);
                 }
             }
             self.last_ts = Some(ts);
@@ -902,7 +909,7 @@ impl OpusPlaybackDecoder {
             let newer = ((ts.wrapping_sub(last)) as i32) > 0;
             if len > 0 && newer {
                 if let Some(pcm) = self.decode_to_pcm(&payload[start..start + len]) {
-                    queue.push(&pcm);
+                    queue.push(pcm);
                 }
                 last = ts;
             }
@@ -1169,6 +1176,29 @@ impl DeliveryRing {
     }
 }
 
+/// Owns the delivery thread for the lifetime of one capture run and tears it down on
+/// `Drop`, so teardown also happens when the capture thread UNWINDS.
+///
+/// Closing the ring is the delivery thread's only wake-up: skip it and the thread parks
+/// in `pop()` forever, pinning the Python callback and leaving `deliver_tid` set to a tid
+/// the OS may hand to an unrelated thread (whose `stop_capture` would then be mistaken
+/// for a re-entrant self-stop and silently do nothing).
+struct DeliveryThread<'a> {
+    ring: Arc<DeliveryRing>,
+    inner: &'a Inner,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for DeliveryThread<'_> {
+    fn drop(&mut self) {
+        self.ring.close();
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        self.inner.deliver_tid.store(0, Ordering::Release);
+    }
+}
+
 /// Recycles outgoing frame buffers from dropped `AudioFrame`s back to the capture
 /// thread, so the steady-state emit path allocates nothing.
 ///
@@ -1292,10 +1322,13 @@ struct RunState<'a> {
     /// RFC 2198 redundancy history: the last `red_distance` emitted `(opus, pts)` frames,
     /// oldest-first. Per-run — reset on start, and the frame size is fixed for a run.
     red_history: VecDeque<(Vec<u8>, u64)>,
+    /// Retired `red_history` buffers, reused for the next entry so the steady state (a
+    /// silence gap included) allocates nothing. Bounded by `red_distance`: every buffer
+    /// is either in the history or here.
+    red_spare: Vec<Vec<u8>>,
     red_distance: usize,
     total_samples_processed: u64,
     first_sound_detected: bool,
-    last_requested_bitrate: i32,
     current_applied_bitrate: i32,
     chunks_read: u64,
     chunks_silent: u64,
@@ -1347,8 +1380,9 @@ impl<'a> RunState<'a> {
     ///    encoded DIRECTLY after it — no assembly copy, and the buffer recycles through the
     ///    pool, so the steady state allocates nothing. An encode error or a zero-length packet
     ///    returns the buffer to the pool and drops the frame.
-    /// 5. **Retain redundancy**: with `red_distance > 0`, the just-encoded primary is pushed
-    ///    onto `red_history` (bounded, oldest-first) to serve as a future redundant copy.
+    /// 5. **Retain redundancy**: with `red_distance > 0`, the just-encoded primary is copied
+    ///    onto `red_history` (bounded, oldest-first) to serve as a future redundant copy,
+    ///    into the buffer the retiring entry hands back.
     /// 6. **Hand off**: the truncated buffer is pushed to the `DeliveryRing`; the capture
     ///    thread itself never touches the GIL.
     fn emit_frame(&mut self) {
@@ -1364,11 +1398,10 @@ impl<'a> RunState<'a> {
                         requested / 1000
                     );
                     self.current_applied_bitrate = requested;
-                    self.last_requested_bitrate = requested;
                 }
                 Err(e) => {
-                    // Keep last_requested_bitrate stale so a rejected value is retried
-                    // instead of being latched as if it had been applied.
+                    // current_applied_bitrate stays put, so the next frame retries the
+                    // rejected value instead of latching it as if it had been applied.
                     elog!("[pcmflux] Failed to update bitrate ({requested}): {e:?}");
                 }
             }
@@ -1383,8 +1416,10 @@ impl<'a> RunState<'a> {
             self.chunks_silent += 1;
             // Flush the RED backlog: if these pre-silence frames were kept, the first
             // packet after a long quiet stretch would ship minutes-old audio as
-            // "redundant" data, and a receiver could reconstruct it into the gap.
-            self.red_history.clear();
+            // "redundant" data, and a receiver could reconstruct it into the gap. The
+            // emptied buffers are kept for reuse, so a silence gap costs no allocations.
+            self.red_spare
+                .extend(self.red_history.drain(..).map(|(v, _)| v));
             return;
         }
         if !self.first_sound_detected {
@@ -1414,18 +1449,21 @@ impl<'a> RunState<'a> {
                 return;
             }
         };
-        self.chunks_encoded += 1;
-        self.bytes_encoded += encoded as u64;
         if encoded == 0 {
             self.pool.put(data);
             return;
         }
+        self.chunks_encoded += 1;
+        self.bytes_encoded += encoded as u64;
         if self.red_distance > 0 {
-            self.red_history
-                .push_back((data[prefix..prefix + encoded].to_vec(), pts));
-            while self.red_history.len() > self.red_distance {
-                self.red_history.pop_front();
-            }
+            let mut slot = if self.red_history.len() >= self.red_distance {
+                self.red_history.pop_front().map(|(v, _)| v).unwrap_or_default()
+            } else {
+                self.red_spare.pop().unwrap_or_default()
+            };
+            slot.clear();
+            slot.extend_from_slice(&data[prefix..prefix + encoded]);
+            self.red_history.push_back((slot, pts));
         }
         data.truncate(prefix + encoded);
 
@@ -1481,7 +1519,8 @@ struct PaCaptureSession {
 
 /// Why a session failed to open: drives the retry policy of the caller.
 enum SessionOpenError {
-    /// The named source is absent (misconfiguration-ish); starts fail fast on this.
+    /// The named source is absent at startup (misconfiguration-ish); the caller gives it
+    /// only its short bring-up window rather than the full startup retry budget.
     DeviceNotFound(String),
     /// Server down, busy, or a bring-up race: retryable.
     Transient(String),
@@ -1494,9 +1533,10 @@ enum SessionOpenError {
 /// an introspect probe on every call (an async connect_record would not fail
 /// synchronously on a bad name, and on reconnect this is also what notices the device
 /// reappearing after an outage). `device_was_present` distinguishes initial bring-up
-/// from reconnect: a named device missing at startup is a misconfiguration worth
-/// failing fast on; the same device vanishing mid-run (PulseAudio/PipeWire restart
-/// kills every source) is transient and must be retried or audio never comes back.
+/// from reconnect: a named device missing at startup is probably a misconfiguration, so
+/// it is reported as `DeviceNotFound` and the caller spends only a short window on it;
+/// the same device vanishing mid-run (PulseAudio/PipeWire restart kills every source) is
+/// transient and must be retried or audio never comes back.
 fn pa_capture_session_open(
     inner: &Inner,
     spec: &Spec,
@@ -1688,13 +1728,17 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     let channels = settings.channels as usize;
 
     let ring = Arc::new(DeliveryRing::new(8));
-    let max_pkt = if settings.channels > 2 { 4 * MAX_OPUS_PACKET } else { MAX_OPUS_PACKET };
+    // Surround encodes one self-delimited packet per multistream stream (4 for 5.1, 5 for
+    // 7.1), so the worst-case body scales with the stream count of the actual layout.
+    let max_pkt = multiopus_layout(settings.channels)
+        .map_or(1, |(streams, _, _)| streams as usize)
+        * MAX_OPUS_PACKET;
     let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + max_pkt));
     let deliver_ring = Arc::clone(&ring);
     let deliver_pool = Arc::clone(&pool);
     let deliver_inner = Arc::clone(inner);
     let deliver_cb: Py<PyAny> = Python::attach(|py| callback.clone_ref(py));
-    let deliver_join = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("pcmflux-deliver".into())
         .spawn(move || {
             unsafe {
@@ -1720,13 +1764,19 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
                 });
             }
             deliver_inner.deliver_tid.store(0, Ordering::Release);
-        })
-        .ok();
-    if deliver_join.is_none() {
-        elog!("[pcmflux] ERROR: delivery thread spawn failed.");
-        fail();
-        return;
-    }
+        });
+    let delivery = match spawned {
+        Ok(join) => DeliveryThread {
+            ring: Arc::clone(&ring),
+            inner,
+            join: Some(join),
+        },
+        Err(_) => {
+            elog!("[pcmflux] ERROR: delivery thread spawn failed.");
+            fail();
+            return;
+        }
+    };
 
     let mut run = RunState {
         inner,
@@ -1739,10 +1789,10 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         pcm_fill_bytes: 0,
         pool: PoolTaker::new(Arc::clone(&pool)),
         red_history: VecDeque::new(),
+        red_spare: Vec::new(),
         red_distance: settings.red_distance.max(0) as usize,
         total_samples_processed: 0,
         first_sound_detected: false,
-        last_requested_bitrate: settings.opus_bitrate,
         current_applied_bitrate: settings.opus_bitrate,
         chunks_read: 0,
         chunks_silent: 0,
@@ -1754,9 +1804,16 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
 
     // Session loop: the record stream CAN die mid-run (PulseAudio/PipeWire restart,
     // source unplugged) and a plain `break` there leaves audio dead until some
-    // unrelated settings change restarts the capture. Reopen with backoff instead:
-    // startup gets a short window (bring-up races), steady-state reconnects a longer
-    // one; an absent NAMED source always fails fast (misconfiguration).
+    // unrelated settings change restarts the capture. Reopen with backoff instead.
+    // Three retry budgets, shortest first:
+    //   - DEVICE_WAIT_TRIES: a start that finds the NAMED source missing. The sink whose
+    //     monitor is being recorded may still be materializing (container bring-up, or a
+    //     capture start that raced a server restart), but a misconfigured name must still
+    //     surface quickly, so this window is only a few seconds.
+    //   - START_TRIES: any other failure to bring the first session up.
+    //   - RECONNECT_TRIES: a mid-run reconnect, which has to outlast a whole
+    //     PulseAudio/PipeWire restart or audio never comes back.
+    const DEVICE_WAIT_TRIES: u32 = 6;
     const START_TRIES: u32 = 12;
     const RECONNECT_TRIES: u32 = 40;
     let mut session: Option<PaCaptureSession> = None;
@@ -1770,7 +1827,14 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
             break;
         }
         if session.is_none() {
-            match pa_capture_session_open(inner, &spec, device, &attr, adjust_latency, ever_connected) {
+            let opened =
+                pa_capture_session_open(inner, &spec, device, &attr, adjust_latency, ever_connected);
+            let cap = match (&opened, ever_connected) {
+                (Err(SessionOpenError::DeviceNotFound(_)), _) => DEVICE_WAIT_TRIES,
+                (_, true) => RECONNECT_TRIES,
+                (_, false) => START_TRIES,
+            };
+            match opened {
                 Ok(s) => {
                     session = Some(s);
                     tries = 0;
@@ -1798,14 +1862,8 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
                     }
                 }
                 Err(SessionOpenError::Aborted) => break,
-                Err(SessionOpenError::DeviceNotFound(e)) => {
-                    elog!("[pcmflux] ERROR: {e}");
-                    terminal_error = Some(e);
-                    break;
-                }
-                Err(SessionOpenError::Transient(e)) => {
+                Err(SessionOpenError::DeviceNotFound(e)) | Err(SessionOpenError::Transient(e)) => {
                     tries += 1;
-                    let cap = if ever_connected { RECONNECT_TRIES } else { START_TRIES };
                     if tries >= cap {
                         terminal_error = Some(e);
                         break;
@@ -1825,12 +1883,17 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         if !pump(&mut s.mainloop, PUMP_TIMEOUT_US) {
             elog!("[pcmflux] ERROR: mainloop iterate failed; reopening the session.");
             session = None;
+            // Drop the partially reassembled frame: the next fragments come from after
+            // the outage, and stitching them onto pre-outage PCM would emit one frame
+            // with a discontinuity in the middle, charged to the wrong pts.
+            run.pcm_fill_bytes = 0;
             continue;
         }
         let sstate = s.stream.get_state();
         if sstate != pulse::stream::State::Ready {
             elog!("[pcmflux] record stream lost; reopening the session.");
             session = None;
+            run.pcm_fill_bytes = 0;
             continue;
         }
 
@@ -1887,17 +1950,18 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     } else {
         plog!("[pcmflux] Stop requested. Cleaning up capture loop...");
         inner.started_ok.store(false, Ordering::Release);
+        if !ever_connected {
+            // Stopped before the first session came up: resolve the startup handshake, or
+            // the waiting `start_capture` polls out with the run still marked STARTING.
+            inner.start_state.store(ST_FAILED, Ordering::Release);
+        }
     }
     if let Some(s) = session.as_mut() {
         let _ = s.stream.disconnect();
     }
     drop(session);
     drop(run);
-    ring.close();
-    if let Some(j) = deliver_join {
-        let _ = j.join();
-    }
-    inner.deliver_tid.store(0, Ordering::Release);
+    drop(delivery);
     let dropped = ring.dropped.load(Ordering::Relaxed);
     if dropped > 0 {
         plog!("[pcmflux] Delivery ring dropped {dropped} stale frame(s) to a slow consumer.");
@@ -1906,13 +1970,108 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
 }
 
 
+/// One PulseAudio session for playback: mainloop, context, and the playback stream, all
+/// recreated together on reconnect — the mirror of `PaCaptureSession`, with the same
+/// drop-order requirement (stream first, then its context, then the mainloop).
+struct PaPlaybackSession {
+    stream: Stream,
+    /// Must outlive the stream (the connection owns it); never read after open.
+    #[allow(dead_code)]
+    context: Context,
+    mainloop: Mainloop,
+}
+
+/// Open a playback session: mainloop + context + playback stream driven to `Ready` on the
+/// bounded pump, honoring `stop_pending` at every turn. The mirror of
+/// `pa_capture_session_open`.
+///
+/// Every failure is `Transient`: `connect_playback` resolves a sink name asynchronously,
+/// so a wrong device name and a server that is still coming up are the same failed stream
+/// state here, and the caller's retry budget is what bounds either one.
+fn pa_playback_session_open(
+    inner: &Inner,
+    spec: &Spec,
+    device: Option<&str>,
+    attr: &BufferAttr,
+) -> Result<PaPlaybackSession, SessionOpenError> {
+    let tr = |e: &str| SessionOpenError::Transient(e.to_string());
+    let mut mainloop = match Mainloop::new() {
+        Some(m) => m,
+        None => return Err(tr("pa_mainloop_new() failed (playback)")),
+    };
+    let mut context = match Context::new(&mainloop, "pcmflux") {
+        Some(c) => c,
+        None => return Err(tr("pa_context_new() failed (playback)")),
+    };
+    if context.connect(None, CtxFlags::NOFLAGS, None).is_err() {
+        return Err(tr("pa_context_connect() failed (playback)"));
+    }
+    loop {
+        let st = context.get_state();
+        if st == pulse::context::State::Ready {
+            break;
+        }
+        if !st.is_good() {
+            return Err(tr("PulseAudio context connection failed (playback)"));
+        }
+        if inner.stop_pending() {
+            return Err(SessionOpenError::Aborted);
+        }
+        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
+            return Err(tr("mainloop iterate failed during connect (playback)"));
+        }
+    }
+
+    let mut stream = match Stream::new(&mut context, "Microphone Playback", spec, None) {
+        Some(s) => s,
+        None => return Err(tr("pa_stream_new() failed (playback)")),
+    };
+    if stream
+        .connect_playback(device, Some(attr), StreamFlags::ADJUST_LATENCY, None, None)
+        .is_err()
+    {
+        return Err(SessionOpenError::Transient(format!(
+            "pa_stream_connect_playback() failed (device '{}')",
+            device.unwrap_or("default")
+        )));
+    }
+    loop {
+        let st = stream.get_state();
+        if st == pulse::stream::State::Ready {
+            break;
+        }
+        if !st.is_good() {
+            return Err(SessionOpenError::Transient(format!(
+                "PulseAudio playback stream failed (device '{}')",
+                device.unwrap_or("default")
+            )));
+        }
+        if inner.stop_pending() {
+            return Err(SessionOpenError::Aborted);
+        }
+        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
+            return Err(tr("mainloop iterate failed during stream connect (playback)"));
+        }
+    }
+    Ok(PaPlaybackSession {
+        stream,
+        context,
+        mainloop,
+    })
+}
+
 /// Drive one whole mic-playback run on the playback thread. The body handed to
 /// `spawn_worker`; the mirror of `capture_run` for the uplink.
 ///
 /// This thread solely owns the PA playback stream, so writes are serialized structurally
-/// with no executor. It mirrors `capture_run`'s startup + bounded-pump lifecycle:
-/// `start_state` goes `RUNNING` on entering the hot loop and `FAILED` on any startup error,
-/// and it returns when `stop_state` leaves `STOP_NONE` or on a fatal error.
+/// with no executor. It mirrors `capture_run`'s lifecycle: `start_state` goes `RUNNING`
+/// once the first session is up and `FAILED` when the run gives up, and it returns when
+/// `stop_state` leaves `STOP_NONE` or the retry budget is spent.
+///
+/// **Session loop**: the sink can die under a live stream (PulseAudio/PipeWire restart,
+/// sink removed). Breaking out there would leave the mic uplink dead until something
+/// upstream noticed and restarted the whole playback, losing every packet in between, so
+/// the session is reopened with the same backoff and budgets capture uses.
 ///
 /// **Buffer sizing and the prebuf timing rule** (load-bearing): `tlength` is the target
 /// latency in bytes, and `prebuf` is a quarter of it, floored to one frame. `prebuf` must
@@ -1959,51 +2118,6 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         settings.latency_ms
     );
 
-    let mut mainloop = match pulse::mainloop::standard::Mainloop::new() {
-        Some(m) => m,
-        None => {
-            elog!("[pcmflux] ERROR: pa_mainloop_new() failed (playback).");
-            fail();
-            return;
-        }
-    };
-    let mut context = match Context::new(&mainloop, "pcmflux") {
-        Some(c) => c,
-        None => {
-            elog!("[pcmflux] ERROR: pa_context_new() failed (playback).");
-            fail();
-            return;
-        }
-    };
-    if context.connect(None, CtxFlags::NOFLAGS, None).is_err() {
-        elog!("[pcmflux] ERROR: pa_context_connect() failed (playback).");
-        fail();
-        return;
-    }
-
-    loop {
-        let st = context.get_state();
-        if st == pulse::context::State::Ready {
-            break;
-        }
-        if !st.is_good() {
-            elog!("[pcmflux] ERROR: PulseAudio context connection failed (playback).");
-            fail();
-            return;
-        }
-        if inner.stop_pending() {
-            elog!("[pcmflux] audio playback start aborted: stop during startup (context).");
-            fail();
-            return;
-        }
-        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            elog!("[pcmflux] ERROR: mainloop iterate failed during connect (playback).");
-            fail();
-            return;
-        }
-    }
-    plog!("[pcmflux] SUCCESS: Connected to PulseAudio (playback).");
-
     let tlength =
         spec.usec_to_bytes(MicroSeconds(settings.latency_ms.max(0) as u64 * 1000)) as u32;
     let attr = BufferAttr {
@@ -2014,83 +2128,86 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         fragsize: u32::MAX,
     };
 
-    let mut stream = match Stream::new(&mut context, "Microphone Playback", &spec, None) {
-        Some(s) => s,
-        None => {
-            elog!("[pcmflux] ERROR: pa_stream_new() failed (playback).");
-            fail();
-            return;
-        }
-    };
-    if stream
-        .connect_playback(device, Some(&attr), StreamFlags::ADJUST_LATENCY, None, None)
-        .is_err()
-    {
-        elog!(
-            "[pcmflux] ERROR: pa_stream_connect_playback() failed (device '{}').",
-            device.unwrap_or("default")
-        );
-        fail();
-        return;
-    }
-
-    loop {
-        let st = stream.get_state();
-        if st == pulse::stream::State::Ready {
-            break;
-        }
-        if !st.is_good() {
-            elog!(
-                "[pcmflux] ERROR: PulseAudio playback stream failed (device '{}').",
-                device.unwrap_or("default")
-            );
-            fail();
-            return;
-        }
-        if inner.stop_pending() {
-            elog!("[pcmflux] audio playback start aborted: stop during stream connect.");
-            fail();
-            return;
-        }
-        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            elog!("[pcmflux] ERROR: mainloop iterate failed during stream connect (playback).");
-            fail();
-            return;
-        }
-    }
-
-    plog!(
-        "[pcmflux] Playback loop started. Device: {}, Rate: {}, Channels: {}, Latency: {}ms",
-        device.unwrap_or("system_default"),
-        settings.sample_rate,
-        settings.channels,
-        settings.latency_ms
-    );
-
-    inner.started_ok.store(true, Ordering::Release);
-    inner.start_state.store(ST_RUNNING, Ordering::Release);
+    // Retry budgets, matching capture: a start gets a short window, a mid-run reconnect
+    // one long enough to outlast a whole PulseAudio/PipeWire restart.
+    const START_TRIES: u32 = 12;
+    const RECONNECT_TRIES: u32 = 40;
+    let mut session: Option<PaPlaybackSession> = None;
+    let mut ever_connected = false;
+    let mut tries: u32 = 0;
+    let mut backoff_ms: u64 = 250;
+    let mut terminal_error: Option<String> = None;
 
     let mut scratch: Vec<u8> = Vec::new();
     let mut bytes_written: u64 = 0;
     let mut writable_hits: u64 = 0;
     let mut last_pb_log = Instant::now();
-    while !inner.stop_pending() {
-        if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            elog!("[pcmflux] ERROR: mainloop iterate failed; stopping playback.");
-            inner.started_ok.store(false, Ordering::Release);
+
+    loop {
+        if inner.stop_pending() {
             break;
         }
-        if stream.get_state() != pulse::stream::State::Ready {
-            elog!("[pcmflux] ERROR: playback stream entered a non-ready state; stopping.");
-            inner.started_ok.store(false, Ordering::Release);
-            break;
+        if session.is_none() {
+            match pa_playback_session_open(inner, &spec, device, &attr) {
+                Ok(s) => {
+                    session = Some(s);
+                    tries = 0;
+                    backoff_ms = 250;
+                    if !ever_connected {
+                        ever_connected = true;
+                        inner.started_ok.store(true, Ordering::Release);
+                        inner.start_state.store(ST_RUNNING, Ordering::Release);
+                        plog!(
+                            "[pcmflux] Playback loop started. Device: {}, Rate: {}, Channels: {}, Latency: {}ms",
+                            device.unwrap_or("system_default"),
+                            settings.sample_rate,
+                            settings.channels,
+                            settings.latency_ms
+                        );
+                    } else {
+                        // Mic audio queued during the outage is stale; playing it out
+                        // would only push that much extra latency into the uplink.
+                        queue.clear();
+                        plog!("[pcmflux] audio playback reconnected; resuming.");
+                    }
+                }
+                Err(SessionOpenError::Aborted) => break,
+                Err(SessionOpenError::DeviceNotFound(e)) | Err(SessionOpenError::Transient(e)) => {
+                    tries += 1;
+                    let cap = if ever_connected { RECONNECT_TRIES } else { START_TRIES };
+                    if tries >= cap {
+                        terminal_error = Some(e);
+                        break;
+                    }
+                    elog!("[pcmflux] audio playback open failed ({e}); retry {tries}/{cap} in {backoff_ms}ms");
+                    let mut slept = 0u64;
+                    while slept < backoff_ms && !inner.stop_pending() {
+                        std::thread::sleep(Duration::from_millis(50));
+                        slept += 50;
+                    }
+                    backoff_ms = (backoff_ms * 2).min(5000);
+                    continue;
+                }
+            }
         }
-        if let Some(can) = stream.writable_size() {
+        let s = session.as_mut().expect("session checked above");
+        if !pump(&mut s.mainloop, PUMP_TIMEOUT_US) {
+            elog!("[pcmflux] ERROR: mainloop iterate failed; reopening the playback session.");
+            session = None;
+            continue;
+        }
+        if s.stream.get_state() != pulse::stream::State::Ready {
+            elog!("[pcmflux] playback stream lost; reopening the session.");
+            session = None;
+            continue;
+        }
+        if let Some(can) = s.stream.writable_size() {
             if can > 0 {
                 writable_hits += 1;
                 queue.drain_upto(can, &mut scratch);
                 if !scratch.is_empty() {
-                    if let Err(e) = stream.write(&scratch, None, 0, pulse::stream::SeekMode::Relative)
+                    if let Err(e) =
+                        s.stream.write(&scratch, None, 0, pulse::stream::SeekMode::Relative)
                     {
                         elog!("[pcmflux] ERROR: pa_stream_write() failed: {e:?}");
                     } else {
@@ -2108,12 +2225,22 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         }
     }
 
-    plog!("[pcmflux] Stop requested. Cleaning up playback loop...");
-    inner.started_ok.store(false, Ordering::Release);
-    let _ = stream.disconnect();
-    drop(stream);
-    drop(context);
-    drop(mainloop);
+    if let Some(e) = terminal_error {
+        elog!("[pcmflux] ERROR: audio playback could not stay connected (last error: {e}); stopping.");
+        fail();
+    } else {
+        plog!("[pcmflux] Stop requested. Cleaning up playback loop...");
+        inner.started_ok.store(false, Ordering::Release);
+        if !ever_connected {
+            // Stopped before the first session came up: resolve the startup handshake, so
+            // `worker_alive` stops reporting a STARTING run that will never run.
+            inner.start_state.store(ST_FAILED, Ordering::Release);
+        }
+    }
+    if let Some(s) = session.as_mut() {
+        let _ = s.stream.disconnect();
+    }
+    drop(session);
     plog!("[pcmflux] Audio playback loop finished. Resources released.");
 }
 
@@ -2403,8 +2530,9 @@ impl AudioPlayback {
     /// Push one Opus mic packet for playback. The steady-state hot path.
     ///
     /// Gated on `worker_alive`: it raises once no playback thread services the queue (start
-    /// failure, stop, or a mid-run PA death), so the caller's reopen-on-error path engages
-    /// instead of the audio being swallowed silently. Otherwise it decodes the packet to PCM
+    /// failure, stop, or a PA outage the session loop could not reconnect through), so the
+    /// caller's reopen-on-error path engages instead of the audio being swallowed silently.
+    /// A reconnect in progress stays "alive" and keeps queueing. Otherwise it decodes to PCM
     /// and enqueues it with the GIL released — the decode touches no Python state, so dropping
     /// the GIL lets it run concurrently with the rest of the app — and a bad packet is dropped
     /// rather than corrupting the stream. It never blocks on PA (drop-oldest happens inside
@@ -2420,7 +2548,7 @@ impl AudioPlayback {
             let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(d) = dec.as_mut() {
                 if let Some(pcm) = d.decode_to_pcm(b) {
-                    self.shared.queue.push(&pcm);
+                    self.shared.queue.push(pcm);
                 }
             }
         });
