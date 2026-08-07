@@ -10,8 +10,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pcmflux",
-    version="2.0.0",
-    author="Linuxserver.io",
+    version="2.1.0",
+    author="Selkies Project",
     author_email="pypi@linuxserver.io",
     description="A performant audio capture pipeline that encodes raw PCM to Opus, skipping silence.",
     long_description=long_description,

@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "pcmflux"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "audiopus_sys",
  "bytemuck",

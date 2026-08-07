@@ -480,14 +480,16 @@ impl AudioFrame {
         view: *mut pyo3::ffi::Py_buffer,
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
-        let r = pyo3::ffi::PyBuffer_FillInfo(
-            view,
-            slf.as_ptr(),
-            slf.data.as_ptr() as *mut std::os::raw::c_void,
-            slf.data.len() as pyo3::ffi::Py_ssize_t,
-            1,
-            flags,
-        );
+        let r = unsafe {
+            pyo3::ffi::PyBuffer_FillInfo(
+                view,
+                slf.as_ptr(),
+                slf.data.as_ptr() as *mut std::os::raw::c_void,
+                slf.data.len() as pyo3::ffi::Py_ssize_t,
+                1,
+                flags,
+            )
+        };
         if r != 0 {
             return Err(PyErr::fetch(slf.py()));
         }
@@ -893,11 +895,10 @@ impl OpusPlaybackDecoder {
 
         if self.last_ts.is_none() {
             let (ts, start, len) = frames[nf - 1];
-            if len > 0 {
-                if let Some(pcm) = self.decode_to_pcm(&payload[start..start + len]) {
+            if len > 0
+                && let Some(pcm) = self.decode_to_pcm(&payload[start..start + len]) {
                     queue.push(pcm);
                 }
-            }
             self.last_ts = Some(ts);
             return;
         }
@@ -1156,12 +1157,10 @@ impl DeliveryRing {
     fn pop(&self) -> Option<(Vec<u8>, u64)> {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match g.as_mut() {
-                None => return None,
-                Some(q) => {
-                    if let Some(item) = q.pop_front() {
-                        return Some(item);
-                    }
+            {
+                let q = g.as_mut()?;
+                if let Some(item) = q.pop_front() {
+                    return Some(item);
                 }
             }
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
@@ -1504,6 +1503,7 @@ impl<'a> RunState<'a> {
 ///    `RunState`. A stop is observed within the pump bound even when the source is wedged. On
 ///    exit it disconnects the stream, drops the encoder, closes and joins the delivery ring,
 ///    and reports any dropped stale frames.
+///
 /// One PulseAudio session for capture: mainloop, context, and the record stream,
 /// all recreated together on reconnect.
 /// Drop order matters (declaration order): the stream must die first, then its
@@ -2201,8 +2201,8 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
             session = None;
             continue;
         }
-        if let Some(can) = s.stream.writable_size() {
-            if can > 0 {
+        if let Some(can) = s.stream.writable_size()
+            && can > 0 {
                 writable_hits += 1;
                 queue.drain_upto(can, &mut scratch);
                 if !scratch.is_empty() {
@@ -2215,7 +2215,6 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
                     }
                 }
             }
-        }
         if inner.debug_logging.load(Ordering::Relaxed) && last_pb_log.elapsed().as_secs() >= 1 {
             plog!(
                 "[pcmflux] Playback | writable_hits: {writable_hits}, bytes_written: {bytes_written}, queued: {}",
@@ -2408,13 +2407,12 @@ impl Drop for AudioCapture {
         let shared = &self.shared;
         Python::attach(|py| {
             py.detach(|| {
-                if let Ok(mut guard) = shared.thread.lock() {
-                    if let Some(handle) = guard.take() {
+                if let Ok(mut guard) = shared.thread.lock()
+                    && let Some(handle) = guard.take() {
                         inner.request_external_stop();
                         let _ = handle.join();
                         inner.capture_tid.store(0, Ordering::Release);
                     }
-                }
             });
         });
     }
@@ -2546,11 +2544,10 @@ impl AudioPlayback {
         let b = data.as_bytes();
         py.detach(|| {
             let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(d) = dec.as_mut() {
-                if let Some(pcm) = d.decode_to_pcm(b) {
+            if let Some(d) = dec.as_mut()
+                && let Some(pcm) = d.decode_to_pcm(b) {
                     self.shared.queue.push(pcm);
                 }
-            }
         });
         Ok(())
     }
@@ -2622,13 +2619,12 @@ impl Drop for AudioPlayback {
         let shared = &self.shared;
         Python::attach(|py| {
             py.detach(|| {
-                if let Ok(mut guard) = shared.thread.lock() {
-                    if let Some(handle) = guard.take() {
+                if let Ok(mut guard) = shared.thread.lock()
+                    && let Some(handle) = guard.take() {
                         inner.request_external_stop();
                         let _ = handle.join();
                         inner.capture_tid.store(0, Ordering::Release);
                     }
-                }
             });
         });
     }
@@ -2649,13 +2645,12 @@ fn _stop_all_captures(py: Python<'_>) {
     };
     for shared in snapshot {
         py.detach(|| {
-            if let Ok(mut guard) = shared.thread.lock() {
-                if let Some(handle) = guard.take() {
+            if let Ok(mut guard) = shared.thread.lock()
+                && let Some(handle) = guard.take() {
                     shared.inner.request_external_stop();
                     let _ = handle.join();
                     shared.inner.capture_tid.store(0, Ordering::Release);
                 }
-            }
         });
     }
     let pb_snapshot: Vec<Arc<PbShared>> = match playback_registry().lock() {
@@ -2664,13 +2659,12 @@ fn _stop_all_captures(py: Python<'_>) {
     };
     for shared in pb_snapshot {
         py.detach(|| {
-            if let Ok(mut guard) = shared.thread.lock() {
-                if let Some(handle) = guard.take() {
+            if let Ok(mut guard) = shared.thread.lock()
+                && let Some(handle) = guard.take() {
                     shared.inner.request_external_stop();
                     let _ = handle.join();
                     shared.inner.capture_tid.store(0, Ordering::Release);
                 }
-            }
         });
     }
 }
