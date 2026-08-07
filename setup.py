@@ -17,7 +17,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="MPL-2.0",
-    url="https://github.com/linuxserver/pcmflux",
+    url="https://github.com/selkies-project/pcmflux",
     packages=[],
     rust_extensions=[
         RustExtension(
