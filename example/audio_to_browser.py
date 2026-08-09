@@ -13,15 +13,23 @@ from pcmflux import AudioCapture, AudioCaptureSettings
 
 # --- Global Shared Context ---
 # These variables manage the server's shared state across different asynchronous
-# tasks and threads.
-g_loop = None           # The main asyncio event loop.
-g_settings = None       # The audio capture configuration.
-g_callback = None       # The C-compatible callback function pointer.
-g_module = None         # The pcmflux.AudioCapture module instance.
-g_clients = {}          # ws -> {'queue': Queue, 'task': Task} per-client relay.
-g_is_capturing = False  # A flag to track the audio capture state.
-g_status_task = None    # The asyncio.Task that periodically logs queue/drop stats.
-g_dropped = 0           # Audio frames dropped because a client queue was full.
+# tasks and threads:
+#   g_loop         the main asyncio event loop
+#   g_settings     the audio capture configuration
+#   g_callback     the C-compatible callback function pointer
+#   g_module       the pcmflux.AudioCapture module instance
+#   g_clients      ws -> {'queue': Queue, 'task': Task} per-client relay
+#   g_is_capturing a flag to track the audio capture state
+#   g_status_task  the asyncio.Task that periodically logs queue/drop stats
+#   g_dropped      audio frames dropped because a client queue was full
+g_loop = None
+g_settings = None
+g_callback = None
+g_module = None
+g_clients = {}
+g_is_capturing = False
+g_status_task = None
+g_dropped = 0
 # --- End Global Context ---
 
 # Delivery: the capture callback never blocks, each client has its own bounded
@@ -112,10 +120,12 @@ async def ws_handler(websocket):
     print(f"Client connected: {websocket.remote_address}. "
           f"Total clients: {len(g_clients)}")
 
-    # If this is the first client, start the audio capture process.
+    # If this is the first client, start the audio capture process. start_capture
+    # blocks until the native thread reports it is running (up to ~2s), so it runs
+    # on a worker thread: the loop keeps feeding every other client meanwhile.
     if not g_is_capturing and g_module:
         print("First client connected. Starting audio capture...")
-        g_module.start_capture(g_settings, g_callback)
+        await asyncio.to_thread(g_module.start_capture, g_settings, g_callback)
         g_is_capturing = True
         if g_status_task is None or g_status_task.done():
             g_status_task = asyncio.create_task(status_logger())
@@ -141,9 +151,11 @@ async def ws_handler(websocket):
         print(f"Client disconnected. Remaining clients: {len(g_clients)}")
 
         # If this was the last client, stop the audio capture to save resources.
+        # The stop joins the capture thread through PulseAudio teardown, so it also
+        # runs on a worker thread rather than stalling the loop.
         if g_is_capturing and not g_clients and g_module:
             print("Last client disconnected. Stopping audio capture...")
-            g_module.stop_capture()
+            await asyncio.to_thread(g_module.stop_capture)
             g_is_capturing = False
             if g_status_task:
                 g_status_task.cancel()
@@ -199,7 +211,8 @@ def _resolve_static_path(script_dir, request_path):
     try:
         requested = os.path.realpath(os.path.join(root, decoded.lstrip('/')))
     except ValueError:
-        return None  # e.g. embedded NUL byte ("%00")
+        # e.g. embedded NUL byte ("%00")
+        return None
     if requested != root and not requested.startswith(root + os.sep):
         return None
     return requested
@@ -317,7 +330,7 @@ async def main_async():
         # its sender), then close the servers.
         print("\nShutting down...")
         if g_module:
-            g_module.stop_capture()
+            await asyncio.to_thread(g_module.stop_capture)
         close_tasks = [ws.close(code=1001, reason='Server shutting down')
                        for ws in list(g_clients.keys())]
         if close_tasks:

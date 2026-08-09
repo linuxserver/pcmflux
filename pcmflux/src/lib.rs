@@ -3091,10 +3091,12 @@ mod tests {
     #[test]
     fn playqueue_misaligned_bound_never_splits_frames() {
         let q = PlayQueue::new();
-        q.configure(9, 4); // floors the bound to 8 = two 4-byte frames
+        // A 9-byte bound over 4-byte frames floors to 8, which is two whole frames.
+        q.configure(9, 4);
         q.push(&[0, 1, 2, 3]);
         q.push(&[4, 5, 6, 7]);
-        q.push(&[8, 9, 10, 11]); // 12 queued, bound 8: exactly the oldest frame goes
+        // With 12 bytes queued against a bound of 8, exactly the oldest frame is dropped.
+        q.push(&[8, 9, 10, 11]);
         let mut out = Vec::new();
         q.drain_upto(100, &mut out);
         assert_eq!(out, vec![4, 5, 6, 7, 8, 9, 10, 11]);
