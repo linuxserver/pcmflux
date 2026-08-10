@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/pcmflux.svg)](https://badge.fury.io/py/pcmflux)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://linuxserver.github.io/pcmflux/)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selkies-project.github.io/pcmflux/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/selkies-project/pcmflux)
 
 pcmflux is a high-performance audio capture and encoding module for Python.
