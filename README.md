@@ -11,7 +11,7 @@ It is designed to capture system audio using PulseAudio, encode it into the Opus
 
 ## Prerequisites
 
-This package builds a native Rust extension (via `setuptools-rust`/PyO3). It requires a Rust toolchain (`cargo`/`rustc`) plus the development headers for PulseAudio and Opus on your system.
+This package builds a native Rust extension (via `setuptools-rust`/PyO3). It requires a Rust toolchain (`cargo`/`rustc` 1.88 or newer) plus the development headers for PulseAudio and Opus on your system.
 
 On Debian/Ubuntu, you can install them with:
 ```bash
@@ -30,8 +30,9 @@ If the system `libopus` is not found, the build falls back to compiling a bundle
 - **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9–3.14)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
 - **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
 - **Multichannel Opus:** Mono, stereo, and 5.1 / 7.1 surround (via the Opus multistream API with Chromium-compatible channel layouts); `channels` accepts 1, 2, 6, or 8.
-- **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo.
+- **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo, and `write` / `write_red` take any bytes-like object (`bytes`, `memoryview`, `bytearray`, ...).
 - **Live Bitrate Updates:** Thread-safe `update_audio_bitrate()` adjusts the Opus bitrate during an active session.
+- **Observable Lifecycle:** `state` (`"idle"` / `"starting"` / `"running"` / `"failed"`) and `last_error` on both `AudioCapture` and `AudioPlayback`, so a capture that fails after `start_capture` returned (PulseAudio took longer than the start handshake, or dropped out mid-run and could not be reconnected) is visible to the caller. Invalid settings raise `ValueError` before a thread is spawned.
 - **PyO3 Extension Module:** A native Rust `pcmflux` extension module (full CPython API, not Limited/abi3) provides PulseAudio capture + Opus encoding.
 - **Python Build System:** Uses `setuptools-rust` to build and package the `pcmflux` PyO3 extension.
 
@@ -70,6 +71,22 @@ capture.stop_capture()
 
 ### API notes
 
+- `start_capture()` raises `ValueError` for settings the encoder or PulseAudio
+  could never accept (sample rate, channel count, frame duration, negative
+  latency, a NUL in `device_name`) and `RuntimeError` when the capture thread
+  fails within the ~2 s start handshake. A PulseAudio server (or the named
+  source) that is still coming up is retried with backoff for longer than
+  that — `start_capture()` then returns with `state == "starting"`, and the
+  outcome is published asynchronously: `state` becomes `"running"`, or
+  `"failed"` with the reason in `last_error`. The same pair reports a capture
+  that drops out mid-run and exhausts its reconnect budget, so a long-lived
+  caller should poll `last_error` (or `state`) and restart when it is set.
+  `is_capturing` is True only in the `"running"` phase.
+- `AudioPlayback.start()` validates `AudioPlaybackSettings` the same way
+  (`latency_ms` and `max_buffer_bytes` must be positive) and exposes the same
+  `is_running` / `state` / `last_error` trio; `write()` / `write_red()` raise
+  `RuntimeError` once the playback thread is gone.
+
 - `update_audio_bitrate(bps)` stores the new Opus bitrate
   atomically; the capture thread re-reads it on the next frame, so it only takes
   effect during an **active** capture session. Calling it while no capture is
@@ -96,3 +113,5 @@ The example client (`index.html`) strips the 2-byte `[0x01, 0x00]` header before
 
 This project is licensed under the **Mozilla Public License Version 2.0**.
 A copy of the MPL 2.0 can be found at https://mozilla.org/MPL/2.0/.
+
+[LICENSES.md](LICENSES.md) inventories the third-party components of a built `pcmflux` (crates, the linked libpulse and libopus, what the wheels bundle) with their licenses, and describes the cargo-deny check (`pcmflux/deny.toml`, the `Licenses` workflow) that keeps the crate graph permissive.

@@ -3,6 +3,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import asyncio
+import http
 import mimetypes
 import os
 import urllib.parse
@@ -77,15 +78,22 @@ async def send_audio_chunks(websocket, queue):
             queue.task_done()
 
 async def status_logger():
-    """Periodically logs queue depth and dropped-frame count so backpressure
-    drops are visible rather than silent."""
+    """Periodically logs the capture state, queue depth and dropped-frame count
+    so backpressure drops are visible rather than silent.
+
+    `start_capture` returns while the native thread may still be retrying the
+    PulseAudio connection, and a capture can also die mid-run once its reconnect
+    budget is spent; polling `state` / `last_error` is how either is noticed.
+    """
     try:
         while True:
             await asyncio.sleep(5)
             depths = [c['queue'].qsize() for c in g_clients.values()]
-            print(f"[server] clients={len(depths)}, "
+            print(f"[server] capture={g_module.state}, clients={len(depths)}, "
                   f"queued(max)={max(depths) if depths else 0}, "
                   f"dropped={g_dropped}")
+            if g_module.last_error:
+                print(f"[server] audio capture failed: {g_module.last_error}")
     except asyncio.CancelledError:
         pass
 
@@ -99,7 +107,7 @@ async def health_check(connection, request):
     """
     if request.path == "/favicon.ico":
         # Return a "204 No Content" response for favicon requests.
-        return connection.respond(204, headers=[], body=b"")
+        return connection.respond(http.HTTPStatus.NO_CONTENT, "")
     # Allow all other requests to proceed to the WebSocket handler.
     return None
 
@@ -129,7 +137,9 @@ async def ws_handler(websocket):
         g_is_capturing = True
         if g_status_task is None or g_status_task.done():
             g_status_task = asyncio.create_task(status_logger())
-        print("Audio capture process initiated.")
+        # "running" once PulseAudio is connected; "starting" while the native
+        # thread is still retrying (the status logger reports how it ends).
+        print(f"Audio capture process initiated (state: {g_module.state}).")
 
     try:
         # Wait for messages from the client. In this demo, we don't expect

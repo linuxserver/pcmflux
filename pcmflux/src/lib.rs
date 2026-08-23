@@ -37,6 +37,7 @@
 //!     inside the callback would cycle (stopper joins capture, capture joins delivery,
 //!     delivery is the stopper).
 
+use pyo3::buffer::PyUntypedBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use std::collections::VecDeque;
@@ -79,12 +80,19 @@ fn gettid() -> i64 {
     unsafe { libc::syscall(libc::SYS_gettid) as i64 }
 }
 
+/// `start_state`: no worker has run yet, or the last run stopped cleanly.
+const ST_IDLE: u8 = 0;
 /// `start_state` handshake: startup in progress.
 const ST_STARTING: u8 = 1;
 /// `start_state` handshake: the hot loop is running.
 const ST_RUNNING: u8 = 2;
-/// `start_state` handshake: startup failed.
+/// `start_state`: the last run ended in error (startup or mid-run); `last_error` says why.
 const ST_FAILED: u8 = 3;
+
+/// Opus target-bitrate bounds (bits/s); the initial `opus_bitrate` and every live update
+/// are clamped into this range so the encoder never sees a value it would reject.
+const OPUS_BITRATE_MIN: i32 = 6000;
+const OPUS_BITRATE_MAX: i32 = 510000;
 
 /// `stop_state` sentinel: no stop pending (running).
 const STOP_NONE: i64 = 0;
@@ -290,32 +298,45 @@ fn valid_opus_duration(ms: f64) -> bool {
 /// Normalize a Python `device_name` (`str | bytes | None`) into `Option<String>`,
 /// mapping both `None` and the empty string to `None` (meaning the system default).
 /// Shared by the capture and playback settings extractors.
+///
+/// An interior NUL is rejected here with `ValueError`: the name becomes a C string for
+/// libpulse on the worker thread, where it could only surface as a panic.
 fn parse_device_name(dev_obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     if dev_obj.is_none() {
-        Ok(None)
-    } else if let Ok(st) = dev_obj.cast::<PyString>() {
-        let v = st.to_str()?.to_string();
-        Ok(if v.is_empty() { None } else { Some(v) })
-    } else if let Ok(b) = dev_obj.cast::<PyBytes>() {
-        let v = String::from_utf8_lossy(b.as_bytes()).into_owned();
-        Ok(if v.is_empty() { None } else { Some(v) })
-    } else {
-        let v: String = dev_obj.extract()?;
-        Ok(if v.is_empty() { None } else { Some(v) })
+        return Ok(None);
     }
+    let v: String = if let Ok(st) = dev_obj.cast::<PyString>() {
+        st.to_str()?.to_string()
+    } else if let Ok(b) = dev_obj.cast::<PyBytes>() {
+        String::from_utf8_lossy(b.as_bytes()).into_owned()
+    } else {
+        dev_obj.extract()?
+    };
+    if v.contains('\0') {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "device_name must not contain NUL bytes",
+        ));
+    }
+    Ok(if v.is_empty() { None } else { Some(v) })
 }
 
-/// Read a Python `AudioCaptureSettings` into a Rust `Settings` by attribute name.
+/// Read a Python `AudioCaptureSettings` into a Rust `Settings` by attribute name,
+/// rejecting with `ValueError` what the worker could only fail on later.
 ///
-/// `red_distance` is clamped into `[0, RED_MAX_DISTANCE]` — it selects how many redundant
-/// Opus copies each frame carries, and cannot exceed the RFC 2198 history depth.
+/// `opus_bitrate` is clamped into the Opus range exactly as `update_audio_bitrate`
+/// clamps a live update; `red_distance` into `[0, RED_MAX_DISTANCE]` — it selects how
+/// many redundant Opus copies each frame carries, and cannot exceed the RFC 2198
+/// history depth. `latency_ms == 0` selects the default fragment size.
 fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
     let device_name = parse_device_name(&s.getattr("device_name")?)?;
-    Ok(Settings {
+    let parsed = Settings {
         device_name,
         sample_rate: s.getattr("sample_rate")?.extract()?,
         channels: s.getattr("channels")?.extract()?,
-        opus_bitrate: s.getattr("opus_bitrate")?.extract()?,
+        opus_bitrate: s
+            .getattr("opus_bitrate")?
+            .extract::<i32>()?
+            .clamp(OPUS_BITRATE_MIN, OPUS_BITRATE_MAX),
         frame_duration_ms: s.getattr("frame_duration_ms")?.extract()?,
         use_vbr: s.getattr("use_vbr")?.extract()?,
         use_silence_gate: s.getattr("use_silence_gate")?.extract()?,
@@ -323,7 +344,41 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
         latency_ms: s.getattr("latency_ms")?.extract()?,
         omit_audio_header: s.getattr("omit_audio_header")?.extract()?,
         red_distance: s.getattr("red_distance")?.extract::<i32>()?.clamp(0, RED_MAX_DISTANCE),
-    })
+    };
+    check_opus_sample_rate(parsed.sample_rate)?;
+    if !valid_opus_duration(parsed.frame_duration_ms) {
+        return value_error(format!(
+            "frame_duration_ms must be one of 2.5, 5, 10, 20, 40 or 60 (got {})",
+            parsed.frame_duration_ms
+        ));
+    }
+    if !matches!(parsed.channels, 1 | 2 | 6 | 8) {
+        return value_error(format!("channels must be 1, 2, 6 or 8 (got {})", parsed.channels));
+    }
+    if parsed.latency_ms < 0 {
+        return value_error(format!(
+            "latency_ms must be >= 0 (got {}); 0 selects the default fragment size",
+            parsed.latency_ms
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Build a `ValueError` for a rejected settings field.
+fn value_error<T>(msg: String) -> PyResult<T> {
+    Err(pyo3::exceptions::PyValueError::new_err(msg))
+}
+
+/// Opus codecs only run at 8, 12, 16, 24 or 48 kHz; anything else would fail encoder or
+/// decoder creation on the worker, so it is rejected up front.
+fn check_opus_sample_rate(rate: u32) -> PyResult<()> {
+    if matches!(rate, 8000 | 12000 | 16000 | 24000 | 48000) {
+        Ok(())
+    } else {
+        value_error(format!(
+            "sample_rate must be 8000, 12000, 16000, 24000 or 48000 (got {rate})"
+        ))
+    }
 }
 
 /// Playback settings, snapshotted from the Python `AudioPlaybackSettings` at
@@ -338,16 +393,33 @@ struct PbSettings {
     debug_logging: bool,
 }
 
-/// Read a Python `AudioPlaybackSettings` into a Rust `PbSettings` by attribute name.
+/// Read a Python `AudioPlaybackSettings` into a Rust `PbSettings` by attribute name,
+/// rejecting with `ValueError` what the playback thread could only fail on later.
+///
+/// `latency_ms` must be positive: it sizes the sink buffer, and a zero target would make
+/// PulseAudio start playback with nothing prebuffered and underrun on every write.
+/// `max_buffer_bytes` must be positive: it bounds the drop-oldest queue, and a zero bound
+/// would discard every chunk as soon as it was queued.
 fn extract_pb_settings(s: &Bound<'_, PyAny>) -> PyResult<PbSettings> {
-    Ok(PbSettings {
+    let parsed = PbSettings {
         device_name: parse_device_name(&s.getattr("device_name")?)?,
         sample_rate: s.getattr("sample_rate")?.extract()?,
         channels: s.getattr("channels")?.extract()?,
         latency_ms: s.getattr("latency_ms")?.extract()?,
         max_buffer_bytes: s.getattr("max_buffer_bytes")?.extract()?,
         debug_logging: s.getattr("debug_logging")?.extract()?,
-    })
+    };
+    check_opus_sample_rate(parsed.sample_rate)?;
+    if !matches!(parsed.channels, 1 | 2) {
+        return value_error(format!("playback channels must be 1 or 2 (got {})", parsed.channels));
+    }
+    if parsed.latency_ms <= 0 {
+        return value_error(format!("latency_ms must be > 0 (got {})", parsed.latency_ms));
+    }
+    if parsed.max_buffer_bytes == 0 {
+        return value_error("max_buffer_bytes must be > 0 (got 0)".to_string());
+    }
+    Ok(parsed)
 }
 
 /// Python-facing capture/encode configuration read by `start_capture`.
@@ -499,17 +571,18 @@ impl AudioFrame {
     unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
-/// Lock-free shared state for one capture (or playback) run: the lifecycle
-/// state machine plus the per-frame settings mirrors the worker reads on the hot path.
+/// Shared state for one capture (or playback) run: the lifecycle state machine plus the
+/// per-frame settings mirrors the worker reads on the hot path — all lock-free except the
+/// rarely touched `last_error`.
 ///
 /// The lifecycle is driven by two atomics — `stop_state` (the single source of truth for
-/// "should this run stop") and `start_state` (the STARTING → RUNNING/FAILED startup
-/// handshake) — plus `capture_tid` and `deliver_tid`, the worker and delivery threads'
-/// OS tids used to detect a re-entrant stop/start issued from inside the Python callback
-/// (which runs on the delivery thread). The remaining atomics mirror settings the worker
-/// consults each frame without re-snapshotting `Settings`, so `update_audio_bitrate` can
-/// retune the encoder mid-run without locking; the silence and header flags are published
-/// once at start and only read per frame.
+/// "should this run stop") and `start_state` (IDLE → STARTING → RUNNING, then FAILED with a
+/// `last_error` or back to IDLE on a clean stop) — plus `capture_tid` and `deliver_tid`, the
+/// worker and delivery threads' OS tids used to detect a re-entrant stop/start issued from
+/// inside the Python callback (which runs on the delivery thread). The remaining atomics
+/// mirror settings the worker consults each frame without re-snapshotting `Settings`, so
+/// `update_audio_bitrate` can retune the encoder mid-run without locking; the silence and
+/// header flags are published once at start and only read per frame.
 struct Inner {
     /// Single lifecycle source of truth: `STOP_NONE` (running), `STOP_EXTERNAL`, or a
     /// positive tid meaning the run self-stopped from inside its own callback (recorded
@@ -519,6 +592,11 @@ struct Inner {
     stop_state: AtomicI64,
     started_ok: AtomicBool,
     start_state: AtomicU8,
+    /// Why the last run failed (`start_state == ST_FAILED`), for Python's `last_error`.
+    /// Written before `ST_FAILED` is published and cleared when a new run is spawned, so
+    /// a failure that lands after the start handshake returned — the retry ladder giving
+    /// up, a mid-run reconnect budget spent, a worker panic — is still observable.
+    last_error: Mutex<Option<String>>,
     /// OS tid of the running capture thread; `0` when no worker is live.
     capture_tid: AtomicI64,
     /// OS tid of the running delivery thread (the one that invokes the Python callback);
@@ -540,7 +618,8 @@ impl Inner {
         Inner {
             stop_state: AtomicI64::new(STOP_NONE),
             started_ok: AtomicBool::new(false),
-            start_state: AtomicU8::new(0),
+            start_state: AtomicU8::new(ST_IDLE),
+            last_error: Mutex::new(None),
             capture_tid: AtomicI64::new(0),
             deliver_tid: AtomicI64::new(0),
             opus_bitrate: AtomicI32::new(128000),
@@ -601,10 +680,48 @@ impl Inner {
     /// `start_state` still `RUNNING`. Producers (e.g. `AudioPlayback::write`) gate on this
     /// so they surface a dead stream instead of feeding state nothing services.
     fn worker_alive(&self) -> bool {
-        if self.start_state.load(Ordering::Acquire) == ST_STARTING {
-            return true;
-        }
+        self.start_state.load(Ordering::Acquire) == ST_STARTING || self.running()
+    }
+
+    /// True while the worker is connected and running with no stop pending — the
+    /// Python `is_capturing` / `is_running` getters.
+    fn running(&self) -> bool {
         self.started_ok.load(Ordering::Acquire) && !self.stop_pending()
+    }
+
+    /// Lifecycle phase for Python's `state`: `"idle"` (no run yet, or the last run stopped
+    /// cleanly), `"starting"` (worker spawned, first PulseAudio session not yet up),
+    /// `"running"` (connected, or reconnecting mid-run, with no stop pending), or
+    /// `"failed"` (the last run ended in error; `last_error` says why). A run that was
+    /// stopped reads `"idle"` again even while its thread is still winding down.
+    fn state_name(&self) -> &'static str {
+        match self.start_state.load(Ordering::Acquire) {
+            ST_STARTING => "starting",
+            ST_FAILED => "failed",
+            ST_RUNNING if self.running() => "running",
+            _ => "idle",
+        }
+    }
+
+    /// Mark the run dead with a reason: logs `msg` to stderr, records it for `last_error`,
+    /// and only then publishes `ST_FAILED`, so a reader that observes the failed state also
+    /// finds its message. Every terminal worker error goes through here.
+    fn fail(&self, msg: String) {
+        elog!("[pcmflux] ERROR: {msg}");
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+        self.started_ok.store(false, Ordering::Release);
+        self.start_state.store(ST_FAILED, Ordering::Release);
+    }
+
+    /// The message of the last run's failure, or `None` while no run has failed since the
+    /// last (re)start.
+    fn last_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Forget the previous run's failure; called by `spawn_worker` as a new run is armed.
+    fn clear_error(&self) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// True when the calling thread is one of this run's own threads — the capture
@@ -642,9 +759,10 @@ fn registry() -> &'static Mutex<Vec<Weak<Shared>>> {
 /// 1. **Stop and join any prior worker**: sets the external stop INSIDE the lock,
 ///    immediately before `join()`, then clears `capture_tid` — the set-before-join
 ///    ordering that makes the lost-stop invariant hold.
-/// 2. **Reset the lifecycle atomics**: clears `stop_state` back to `STOP_NONE` (done ONLY
+/// 2. **Reset the lifecycle state**: clears `stop_state` back to `STOP_NONE` (done ONLY
 ///    here, under the lock, after the join and before the spawn, where no external stop
-///    can be in flight), and arms the startup handshake at `ST_STARTING`.
+///    can be in flight), forgets the previous run's `last_error`, and arms the startup
+///    handshake at `ST_STARTING`.
 /// 3. **Spawn `body` on a named thread**: the thread applies a best-effort `nice` boost
 ///    (audio must not stutter when the captured workload saturates the CPU; EPERM without
 ///    `CAP_SYS_NICE` is silently a no-op), publishes its OS tid into `capture_tid` for the
@@ -665,6 +783,7 @@ fn spawn_worker(
         inner.capture_tid.store(0, Ordering::Release);
     }
     inner.clear_stop();
+    inner.clear_error();
     inner.started_ok.store(false, Ordering::Release);
     inner.start_state.store(ST_STARTING, Ordering::Release);
     let t_inner = inner.clone();
@@ -677,11 +796,13 @@ fn spawn_worker(
         // A worker panic must flip the liveness contract (started_ok/start_state):
         // an unguarded unwind would leave is_capturing reporting true forever with
         // no frames flowing and no error anywhere.
-        let p_inner = t_inner.clone();
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
-            elog!("[pcmflux] ERROR: worker thread panicked; marking the capture dead.");
-            p_inner.started_ok.store(false, Ordering::Release);
-            p_inner.start_state.store(ST_FAILED, Ordering::Release);
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            t_inner.fail(format!("worker thread panicked: {what}"));
         }
         t_inner.capture_tid.store(0, Ordering::Release);
     }) {
@@ -712,6 +833,42 @@ fn join_failed_start(slot: &Mutex<Option<JoinHandle<()>>>, inner: &Inner, spawne
         let _ = handle.join();
         inner.capture_tid.store(0, Ordering::Release);
     }
+}
+
+/// Startup handshake shared by the capture and playback starts: with the GIL released,
+/// waits up to ~2 s for the worker this call spawned (`spawned`) to publish `RUNNING` or
+/// `FAILED`. A worker still `STARTING` when the window closes counts as started — its
+/// retry ladder legitimately runs longer than this — and a failure after that is exposed
+/// through `state` / `last_error` instead. On `FAILED`, `join_failed_start` tears down only
+/// that thread (identity-checked, sparing a concurrent winner) and the worker's recorded
+/// error is raised as `RuntimeError`.
+fn await_start(
+    py: Python<'_>,
+    slot: &Mutex<Option<JoinHandle<()>>>,
+    inner: &Inner,
+    spawned: ThreadId,
+    what: &str,
+) -> PyResult<()> {
+    let mut state = inner.start_state.load(Ordering::Acquire);
+    if state == ST_STARTING {
+        py.detach(|| {
+            for _ in 0..200 {
+                state = inner.start_state.load(Ordering::Acquire);
+                if state != ST_STARTING {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+    if state == ST_FAILED {
+        py.detach(|| join_failed_start(slot, inner, spawned));
+        let why = inner.last_error().unwrap_or_else(|| "unknown error".to_string());
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{what} failed to start: {why}"
+        )));
+    }
+    Ok(())
 }
 
 /// Bounded, drop-oldest byte queue for the mic-PCM handoff into the virtual
@@ -791,6 +948,9 @@ struct OpusPlaybackDecoder {
     dec: opus::Decoder,
     channels: usize,
     pcm: Vec<i16>,
+    /// Inbound scratch for a buffer-protocol payload, copied here under the GIL so the
+    /// off-GIL decode never reads a buffer another Python thread could be mutating.
+    packet: Vec<u8>,
     /// RFC 2198 RED recovery cursor: the timestamp of the last frame decoded, so a
     /// redundant copy of a dropped frame is decoded exactly once, in order. `None` until
     /// the first RED frame arrives.
@@ -807,6 +967,7 @@ impl OpusPlaybackDecoder {
             dec,
             channels: channels.max(1) as usize,
             pcm: Vec::new(),
+            packet: Vec::new(),
             last_ts: None,
         })
     }
@@ -1476,13 +1637,12 @@ impl<'a> RunState<'a> {
 /// thread would tie capture cadence to the GIL and let any Python stall starve the audio.
 /// The body handed to `spawn_worker`.
 ///
-/// Publishes `start_state` for the handshake (`FAILED` on any startup error, `RUNNING` on
-/// entering the hot loop) and returns when `stop_state` leaves `STOP_NONE` or on a fatal
-/// error. The startup sequence, in order:
+/// Publishes `start_state` for the handshake (`RUNNING` on entering the hot loop, `FAILED`
+/// with a `last_error` on any terminal error, `IDLE` on a clean stop) and returns when
+/// `stop_state` leaves `STOP_NONE` or on a fatal error. The startup sequence, in order:
 ///
-/// 1. **Seed the mirrors + validate**: copies the settings snapshot into the `Inner`
-///    per-frame atomics, and rejects an invalid Opus frame duration, channel count, or
-///    sample spec before touching PulseAudio.
+/// 1. **Seed the mirrors**: copies the settings snapshot (already validated by
+///    `extract_settings`) into the `Inner` per-frame atomics.
 /// 2. **Buffer attr / latency**: a configured `latency_ms` uses `ADJUST_LATENCY` with
 ///    `fragsize` set to that latency; otherwise `fragsize` is floored at ~20 ms, which yields
 ///    a prompt first frame and avoids PipeWire's ~2 s default fragment.
@@ -1658,38 +1818,12 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
     inner.emit_audio_header.store(!settings.omit_audio_header, Ordering::Relaxed);
 
-    let fail = || {
-        inner.started_ok.store(false, Ordering::Release);
-        inner.start_state.store(ST_FAILED, Ordering::Release);
-    };
-
-    if !valid_opus_duration(settings.frame_duration_ms) {
-        elog!(
-            "[pcmflux] ERROR: invalid frame_duration_ms ({}). Must be one of 2.5,5,10,20,40,60.",
-            settings.frame_duration_ms
-        );
-        fail();
-        return;
-    }
-    if !matches!(settings.channels, 1 | 2 | 6 | 8) {
-        elog!(
-            "[pcmflux] ERROR: channels must be 1, 2, 6 or 8 (got {}).",
-            settings.channels
-        );
-        fail();
-        return;
-    }
-
+    // Sample rate, channel count and frame duration were validated by `extract_settings`.
     let spec = Spec {
         format: Format::S16le,
         rate: settings.sample_rate,
         channels: settings.channels as u8,
     };
-    if !spec.is_valid() {
-        elog!("[pcmflux] ERROR: invalid sample spec.");
-        fail();
-        return;
-    }
 
     let mut attr = BufferAttr {
         maxlength: u32::MAX,
@@ -1716,8 +1850,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     ) {
         Ok(e) => e,
         Err(e) => {
-            elog!("[pcmflux] ERROR: {e}");
-            fail();
+            inner.fail(e);
             return;
         }
     };
@@ -1771,9 +1904,8 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
             inner,
             join: Some(join),
         },
-        Err(_) => {
-            elog!("[pcmflux] ERROR: delivery thread spawn failed.");
-            fail();
+        Err(e) => {
+            inner.fail(format!("delivery thread spawn failed: {e}"));
             return;
         }
     };
@@ -1944,17 +2076,16 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
     }
 
     if let Some(e) = terminal_error {
-        elog!("[pcmflux] ERROR: audio capture could not stay connected (last error: {e}); stopping.");
-        inner.started_ok.store(false, Ordering::Release);
-        inner.start_state.store(ST_FAILED, Ordering::Release);
+        inner.fail(format!(
+            "audio capture could not {} (last error: {e}); stopping.",
+            if ever_connected { "stay connected" } else { "connect" }
+        ));
     } else {
         plog!("[pcmflux] Stop requested. Cleaning up capture loop...");
         inner.started_ok.store(false, Ordering::Release);
-        if !ever_connected {
-            // Stopped before the first session came up: resolve the startup handshake, or
-            // the waiting `start_capture` polls out with the run still marked STARTING.
-            inner.start_state.store(ST_FAILED, Ordering::Release);
-        }
+        // A stop before the first session came up must also resolve the startup
+        // handshake, or the waiting `start_capture` polls out with the run still STARTING.
+        inner.start_state.store(ST_IDLE, Ordering::Release);
     }
     if let Some(s) = session.as_mut() {
         let _ = s.stream.disconnect();
@@ -2065,8 +2196,9 @@ fn pa_playback_session_open(
 ///
 /// This thread solely owns the PA playback stream, so writes are serialized structurally
 /// with no executor. It mirrors `capture_run`'s lifecycle: `start_state` goes `RUNNING`
-/// once the first session is up and `FAILED` when the run gives up, and it returns when
-/// `stop_state` leaves `STOP_NONE` or the retry budget is spent.
+/// once the first session is up, `FAILED` (with a `last_error`) when the run gives up, and
+/// `IDLE` on a clean stop; it returns when `stop_state` leaves `STOP_NONE` or the retry
+/// budget is spent.
 ///
 /// **Session loop**: the sink can die under a live stream (PulseAudio/PipeWire restart,
 /// sink removed). Breaking out there would leave the mic uplink dead until something
@@ -2090,26 +2222,12 @@ fn pa_playback_session_open(
 fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
 
-    let fail = || {
-        inner.started_ok.store(false, Ordering::Release);
-        inner.start_state.store(ST_FAILED, Ordering::Release);
-    };
-
-    if settings.channels != 1 && settings.channels != 2 {
-        elog!("[pcmflux] ERROR: playback channels must be 1 or 2 (got {}).", settings.channels);
-        fail();
-        return;
-    }
+    // Sample rate and channel count were validated by `extract_pb_settings`.
     let spec = Spec {
         format: Format::S16le,
         rate: settings.sample_rate,
         channels: settings.channels as u8,
     };
-    if !spec.is_valid() {
-        elog!("[pcmflux] ERROR: invalid playback sample spec.");
-        fail();
-        return;
-    }
 
     let device = settings.device_name.as_deref();
     plog!(
@@ -2225,16 +2343,16 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     }
 
     if let Some(e) = terminal_error {
-        elog!("[pcmflux] ERROR: audio playback could not stay connected (last error: {e}); stopping.");
-        fail();
+        inner.fail(format!(
+            "audio playback could not {} (last error: {e}); stopping.",
+            if ever_connected { "stay connected" } else { "connect" }
+        ));
     } else {
         plog!("[pcmflux] Stop requested. Cleaning up playback loop...");
         inner.started_ok.store(false, Ordering::Release);
-        if !ever_connected {
-            // Stopped before the first session came up: resolve the startup handshake, so
-            // `worker_alive` stops reporting a STARTING run that will never run.
-            inner.start_state.store(ST_FAILED, Ordering::Release);
-        }
+        // A stop before the first session came up must also resolve the startup
+        // handshake, so `worker_alive` stops reporting a STARTING run that will never run.
+        inner.start_state.store(ST_IDLE, Ordering::Release);
     }
     if let Some(s) = session.as_mut() {
         let _ = s.stream.disconnect();
@@ -2284,10 +2402,12 @@ impl AudioCapture {
     ///    delivery thread, whose in-flight callback needs the GIL, so that would deadlock.
     ///    The stop/clear ordering (the lost-stop invariant) lives in `spawn_worker`.
     /// 3. **Register** the handle for the atexit sweep (best-effort), pruning dead weaks.
-    /// 4. **Startup handshake**: waits up to ~2 s (GIL released) for the thread to publish
-    ///    `RUNNING` or `FAILED`. On `FAILED`, `join_failed_start` tears down ONLY the thread
-    ///    this call spawned (identity-checked) — a concurrent start may already own the slot
-    ///    with a live run that must survive — and the error is surfaced to Python.
+    /// 4. **Startup handshake** (`await_start`): waits up to ~2 s (GIL released) for the
+    ///    thread to publish `RUNNING` or `FAILED`, returning `Ok` while it is still
+    ///    `STARTING` — the retry ladder can run longer than the window, so a later failure
+    ///    is observed through `state` / `last_error`. On `FAILED`, `join_failed_start` tears
+    ///    down ONLY the thread this call spawned (identity-checked) — a concurrent start may
+    ///    already own the slot with a live run that must survive — and `last_error` is raised.
     fn start_capture(
         &self,
         py: Python<'_>,
@@ -2324,27 +2444,7 @@ impl AudioCapture {
             reg.push(Arc::downgrade(&self.shared));
         }
 
-        let mut state = inner.start_state.load(Ordering::Acquire);
-        if state == ST_STARTING {
-            py.detach(|| {
-                for _ in 0..200 {
-                    state = inner.start_state.load(Ordering::Acquire);
-                    if state != ST_STARTING {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            });
-        }
-        if state == ST_FAILED {
-            let shared2 = &self.shared;
-            let inner2 = &inner;
-            py.detach(move || join_failed_start(&shared2.thread, inner2, my_thread));
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "audio capture failed to start (see stderr for details)",
-            ));
-        }
-        Ok(())
+        await_start(py, &self.shared.thread, &inner, my_thread, "audio capture")
     }
 
     /// Stop audio capture, joining the capture thread.
@@ -2380,15 +2480,29 @@ impl AudioCapture {
     /// loop applies it on the next frame, without a restart. Values are clamped to the
     /// valid Opus range so an out-of-range request can never wedge the encoder.
     fn update_audio_bitrate(&self, bps: i32) {
-        let clamped = bps.clamp(6000, 510000);
+        let clamped = bps.clamp(OPUS_BITRATE_MIN, OPUS_BITRATE_MAX);
         self.inner().opus_bitrate.store(clamped, Ordering::Relaxed);
     }
 
-    /// True while a capture worker is running with no stop pending.
+    /// True while a capture worker is connected and running with no stop pending; false
+    /// while still starting and after a failure — see `state` to tell those apart.
     #[getter]
     fn is_capturing(&self) -> bool {
-        let inner = self.inner();
-        inner.started_ok.load(Ordering::Acquire) && !inner.stop_pending()
+        self.inner().running()
+    }
+
+    /// Lifecycle phase: `"idle"`, `"starting"`, `"running"` or `"failed"`. A run that
+    /// fails after `start_capture` returned (its retry ladder gave up, or a mid-run
+    /// reconnect budget was spent) reads `"failed"` with the reason in `last_error`.
+    #[getter]
+    fn state(&self) -> &'static str {
+        self.inner().state_name()
+    }
+
+    /// Why the last run failed, or `None` while no run has failed since the last start.
+    #[getter]
+    fn last_error(&self) -> Option<String> {
+        self.inner().last_error()
     }
 }
 
@@ -2433,6 +2547,70 @@ impl AudioPlayback {
     fn inner(&self) -> &Arc<Inner> {
         &self.shared.inner
     }
+
+    /// Run `decode` on this run's Opus decoder with the bytes of a bytes-like `data`, off
+    /// the GIL. The shared body of `write` and `write_red`.
+    ///
+    /// Gated on `worker_alive`: it raises once no playback thread services the queue (start
+    /// failure, stop, or a PA outage the session loop could not reconnect through), so the
+    /// caller's reopen-on-error path engages instead of the audio being swallowed silently.
+    /// A reconnect in progress stays "alive" and keeps queueing.
+    ///
+    /// A `bytes` payload is immutable, so it is borrowed in place across the GIL release.
+    /// Any other bytes-like object — a C-contiguous buffer-protocol exporter of any item
+    /// format, the same set CPython's own `y*` argument parsing accepts (`memoryview`,
+    /// `bytearray`, `array`, NumPy, an `AudioFrame`, ...) — may be mutated by another Python
+    /// thread once the GIL is dropped, so its bytes are copied under the GIL into the
+    /// decoder's reusable scratch buffer first; an Opus packet is a few hundred bytes, and
+    /// the steady state allocates nothing.
+    fn decode_packet(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        decode: impl FnOnce(&mut OpusPlaybackDecoder, &[u8], &PlayQueue) + Send,
+    ) -> PyResult<()> {
+        if !self.inner().worker_alive() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "audio playback is not running (stream failed, stopped, or never started)",
+            ));
+        }
+        let queue = &*self.shared.queue;
+        if let Ok(b) = data.cast::<PyBytes>() {
+            let packet = b.as_bytes();
+            py.detach(|| {
+                let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(d) = dec.as_mut() {
+                    decode(d, packet, queue);
+                }
+            });
+            return Ok(());
+        }
+        let buf = PyUntypedBuffer::get(data)?;
+        if !buf.is_c_contiguous() {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "a contiguous bytes-like object is required",
+            ));
+        }
+        let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = dec.as_mut() else {
+            return Ok(());
+        };
+        let mut packet = std::mem::take(&mut d.packet);
+        packet.clear();
+        // A C-contiguous Py_buffer exposes exactly `len_bytes()` readable bytes at `buf`,
+        // whatever its item format; the export is held (and the GIL, so no Python thread
+        // can resize or mutate the exporter) for the duration of this copy.
+        let n = buf.len_bytes();
+        if n > 0 {
+            packet.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(buf.buf_ptr() as *const u8, n)
+            });
+        }
+        drop(buf);
+        py.detach(|| decode(d, &packet, queue));
+        d.packet = packet;
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -2454,12 +2632,14 @@ impl AudioPlayback {
     ///
     /// Same shape as capture: a re-entrant start from the playback thread just undoes a
     /// nested self-stop; the worker is spawned with the GIL released (the stop/clear ordering
-    /// lives in `spawn_worker`); the handle is registered for the atexit sweep; and a ~2 s
-    /// startup handshake surfaces a `FAILED` start after tearing down only the thread THIS
-    /// call spawned (identity-checked, sparing a concurrent winner). Before spawning, it
-    /// applies this run's byte bound + frame alignment to the queue (dropping any stale
-    /// audio) and creates the Opus decoder up front, since the mic uplink is always Opus and
-    /// `write` / `write_red` decode packets to PCM off the GIL for this same run.
+    /// lives in `spawn_worker`); the handle is registered for the atexit sweep; and the ~2 s
+    /// `await_start` handshake raises a `FAILED` start (with `last_error`) after tearing
+    /// down only the thread THIS call spawned (identity-checked, sparing a concurrent
+    /// winner), while a start still in its retry ladder returns `Ok` and is watched through
+    /// `state` / `last_error`. Before spawning, it applies this run's byte bound + frame
+    /// alignment to the queue (dropping any stale audio) and creates the Opus decoder up
+    /// front, since the mic uplink is always Opus and `write` / `write_red` decode packets
+    /// to PCM off the GIL for this same run.
     fn start(&self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
         let inner = self.inner().clone();
 
@@ -2502,54 +2682,23 @@ impl AudioPlayback {
             reg.push(Arc::downgrade(&self.shared));
         }
 
-        let mut state = inner.start_state.load(Ordering::Acquire);
-        if state == ST_STARTING {
-            py.detach(|| {
-                for _ in 0..200 {
-                    state = inner.start_state.load(Ordering::Acquire);
-                    if state != ST_STARTING {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            });
-        }
-        if state == ST_FAILED {
-            let shared2 = &self.shared;
-            let inner2 = &inner;
-            py.detach(move || join_failed_start(&shared2.thread, inner2, my_thread));
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "audio playback failed to start (see stderr for details)",
-            ));
-        }
-        Ok(())
+        await_start(py, &self.shared.thread, &inner, my_thread, "audio playback")
     }
 
     /// Push one Opus mic packet for playback. The steady-state hot path.
     ///
-    /// Gated on `worker_alive`: it raises once no playback thread services the queue (start
-    /// failure, stop, or a PA outage the session loop could not reconnect through), so the
-    /// caller's reopen-on-error path engages instead of the audio being swallowed silently.
-    /// A reconnect in progress stays "alive" and keeps queueing. Otherwise it decodes to PCM
-    /// and enqueues it with the GIL released — the decode touches no Python state, so dropping
-    /// the GIL lets it run concurrently with the rest of the app — and a bad packet is dropped
-    /// rather than corrupting the stream. It never blocks on PA (drop-oldest happens inside
-    /// `PlayQueue::push`).
-    fn write(&self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
-        if !self.inner().worker_alive() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "audio playback is not running (stream failed, stopped, or never started)",
-            ));
-        }
-        let b = data.as_bytes();
-        py.detach(|| {
-            let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(d) = dec.as_mut()
-                && let Some(pcm) = d.decode_to_pcm(b) {
-                    self.shared.queue.push(pcm);
-                }
-        });
-        Ok(())
+    /// `data` is any bytes-like object (`bytes`, `memoryview`, `bytearray`, an
+    /// `AudioFrame`, ...); see `decode_packet` for the liveness gate and how the payload is
+    /// borrowed. The decode runs with the GIL released — it touches no Python state, so
+    /// dropping the GIL lets it run concurrently with the rest of the app — and a bad packet
+    /// is dropped rather than corrupting the stream. It never blocks on PA (drop-oldest
+    /// happens inside `PlayQueue::push`).
+    fn write(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.decode_packet(py, data, |dec, packet, queue| {
+            if let Some(pcm) = dec.decode_to_pcm(packet) {
+                queue.push(pcm);
+            }
+        })
     }
 
     /// Play one RFC 2198 RED mic frame from the WebRTC/UDP uplink, recovering across any
@@ -2558,21 +2707,12 @@ impl AudioPlayback {
     /// The payload is de-framed, loss-recovered, and decoded entirely off the GIL by
     /// `decode_red_into_queue` (see there for why RED exists and why the decode runs off the
     /// GIL). `primary_ts` is the packet's monotonic RTP timestamp; the redundant blocks carry
-    /// offsets back from it. Gated on `worker_alive` exactly like `write`.
-    fn write_red(&self, py: Python<'_>, data: &Bound<'_, PyBytes>, primary_ts: i64) -> PyResult<()> {
-        if !self.inner().worker_alive() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "audio playback is not running (stream failed, stopped, or never started)",
-            ));
-        }
-        let b = data.as_bytes();
-        py.detach(|| {
-            let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(d) = dec.as_mut() {
-                d.decode_red_into_queue(b, primary_ts, &self.shared.queue);
-            }
-        });
-        Ok(())
+    /// offsets back from it. Accepts any bytes-like `data` and is gated on `worker_alive`
+    /// exactly like `write` (see `decode_packet`).
+    fn write_red(&self, py: Python<'_>, data: &Bound<'_, PyAny>, primary_ts: i64) -> PyResult<()> {
+        self.decode_packet(py, data, move |dec, packet, queue| {
+            dec.decode_red_into_queue(packet, primary_ts, queue);
+        })
     }
 
     /// Stop mic playback, joining the playback thread.
@@ -2599,11 +2739,24 @@ impl AudioPlayback {
         });
     }
 
-    /// True while a playback worker is running with no stop pending.
+    /// True while a playback worker is connected and running with no stop pending; false
+    /// while still starting and after a failure — see `state` to tell those apart.
     #[getter]
     fn is_running(&self) -> bool {
-        let inner = self.inner();
-        inner.started_ok.load(Ordering::Acquire) && !inner.stop_pending()
+        self.inner().running()
+    }
+
+    /// Lifecycle phase: `"idle"`, `"starting"`, `"running"` or `"failed"`, the playback
+    /// mirror of `AudioCapture.state`.
+    #[getter]
+    fn state(&self) -> &'static str {
+        self.inner().state_name()
+    }
+
+    /// Why the last run failed, or `None` while no run has failed since the last start.
+    #[getter]
+    fn last_error(&self) -> Option<String> {
+        self.inner().last_error()
     }
 }
 
@@ -3126,6 +3279,66 @@ mod tests {
         inner.started_ok.store(true, Ordering::Release);
         inner.request_external_stop();
         assert!(!inner.worker_alive());
+    }
+
+    /// `state_name` / `last_error` follow the lifecycle the Python getters expose: idle
+    /// before any run, starting through the handshake, running once connected, and
+    /// failed — with the reason recorded BEFORE the state flips — after `fail`. A new run
+    /// armed by `spawn_worker` forgets the previous failure.
+    #[test]
+    fn state_and_last_error_track_lifecycle() {
+        let inner = Arc::new(Inner::new());
+        assert_eq!(inner.state_name(), "idle");
+        assert_eq!(inner.last_error(), None);
+
+        inner.start_state.store(ST_STARTING, Ordering::Release);
+        assert_eq!(inner.state_name(), "starting");
+        assert!(!inner.running());
+
+        inner.started_ok.store(true, Ordering::Release);
+        inner.start_state.store(ST_RUNNING, Ordering::Release);
+        assert_eq!(inner.state_name(), "running");
+        assert!(inner.running());
+
+        inner.request_external_stop();
+        assert_eq!(inner.state_name(), "idle", "a pending stop is no longer running");
+        inner.clear_stop();
+
+        inner.fail("source vanished".to_string());
+        assert_eq!(inner.state_name(), "failed");
+        assert_eq!(inner.last_error().as_deref(), Some("source vanished"));
+        assert!(!inner.running());
+        assert!(!inner.worker_alive());
+
+        let slot: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        let wi = inner.clone();
+        spawn_worker(&slot, &inner, "fresh", move || {
+            wi.started_ok.store(false, Ordering::Release);
+            wi.start_state.store(ST_IDLE, Ordering::Release);
+        })
+        .unwrap();
+        slot.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(inner.last_error(), None, "a new run must start with no stale error");
+        assert_eq!(inner.state_name(), "idle", "a clean stop reads idle again");
+    }
+
+    /// A worker body that panics is caught by `spawn_worker`, which marks the run failed
+    /// and records the panic message as `last_error`, so the death is observable from
+    /// Python instead of leaving a silently dead capture.
+    #[test]
+    fn worker_panic_records_last_error() {
+        let inner = Arc::new(Inner::new());
+        let slot: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        spawn_worker(&slot, &inner, "panicky", || panic!("boom"))
+            .unwrap();
+        slot.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(inner.state_name(), "failed");
+        assert_eq!(
+            inner.last_error().as_deref(),
+            Some("worker thread panicked: boom")
+        );
+        assert!(!inner.worker_alive());
+        assert_eq!(inner.capture_tid.load(Ordering::Acquire), 0);
     }
 
     /// A LOSING start's failed-start cleanup must never tear down a WINNING start's

@@ -33,4 +33,8 @@ and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
 fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
+`LICENSES.md` inventories the crates and the linked libpulse (LGPL-2.1-or-later) and libopus (BSD-3-Clause);
+`pcmflux/deny.toml` keeps the crate graph permissive (the `Licenses` workflow runs it). A new crate that links
+native code gets a row there.
+
 Update this file when certain details change.

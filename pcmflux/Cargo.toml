@@ -2,6 +2,8 @@
 name = "pcmflux"
 version = "2.1.0"
 edition = "2024"
+# let-chains (stable in edition 2024 since 1.88) are the newest language feature used.
+rust-version = "1.88"
 
 [lib]
 name = "pcmflux"
