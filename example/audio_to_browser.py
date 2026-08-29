@@ -41,6 +41,10 @@ AUDIO_QUEUE_MAXSIZE = 200
 # connection is closed rather than letting a dead socket linger (drops are
 # already handled upstream by the bounded queue).
 SEND_TIMEOUT_SECONDS = 1.0
+# WebSockets are not subject to CORS, so any page a browser visits could otherwise
+# open this socket and listen in. Only the page this server itself hands out may;
+# None keeps non-browser clients, which send no Origin, working.
+ALLOWED_ORIGINS = ["http://localhost:9001", "http://127.0.0.1:9001", None]
 
 async def send_audio_chunks(websocket, queue):
     """Per-client sender: forwards this client's queue to its socket.
@@ -212,6 +216,12 @@ def _fanout_audio(frame):
             g_dropped += 1
         queue.put_nowait(memoryview(frame))
 
+def _read_file(path):
+    """Read a static file; run off the loop, so a slow read cannot stall the audio."""
+    with open(path, 'rb') as handle:
+        return handle.read()
+
+
 def _resolve_static_path(script_dir, request_path):
     """Return the real path of request_path under script_dir, or None if it
     escapes. realpath canonicalizes '..'/symlinks and the root+os.sep boundary
@@ -239,7 +249,11 @@ async def handle_http_request(reader, writer):
             writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
 
-        path = parts[1].decode()
+        try:
+            path = parts[1].decode()
+        except UnicodeDecodeError:
+            writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            return
         if path == '/':
             path = '/index.html'
 
@@ -252,8 +266,7 @@ async def handle_http_request(reader, writer):
             return
 
         if os.path.isfile(full_path):
-            with open(full_path, 'rb') as f:
-                content = f.read()
+            content = await asyncio.to_thread(_read_file, full_path)
 
             content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
 
@@ -327,7 +340,8 @@ async def main_async():
         'localhost',
         9000,
         process_request=health_check,
-        compression=None
+        compression=None,
+        origins=ALLOWED_ORIGINS,
     )
     print("WebSocket server started on ws://localhost:9000")
 
