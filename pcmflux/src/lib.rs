@@ -776,7 +776,7 @@ fn spawn_worker(
     name: &str,
     body: impl FnOnce() + Send + 'static,
 ) -> Option<ThreadId> {
-    let mut guard = slot.lock().unwrap();
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         inner.request_external_stop();
         let _ = handle.join();
@@ -824,7 +824,7 @@ fn spawn_worker(
 /// is set INSIDE the lock before `join()`, matching every other join site (the
 /// set-before-join / lost-stop invariant).
 fn join_failed_start(slot: &Mutex<Option<JoinHandle<()>>>, inner: &Inner, spawned: ThreadId) {
-    let mut guard = slot.lock().unwrap();
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     if guard.as_ref().map(|h| h.thread().id()) != Some(spawned) {
         return;
     }
@@ -908,7 +908,7 @@ impl PlayQueue {
     /// Drop everything queued, keeping the bounds. Used when a run starts and whenever the
     /// playback session is reopened, since audio buffered across an outage is stale.
     fn clear(&self) {
-        self.buf.lock().unwrap().clear();
+        self.buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Append client PCM, dropping the OLDEST whole frames once the queue passes
@@ -918,7 +918,7 @@ impl PlayQueue {
     fn push(&self, data: &[u8]) {
         let max = self.max_bytes.load(Ordering::Relaxed);
         let fb = self.frame_bytes.load(Ordering::Relaxed);
-        let mut q = self.buf.lock().unwrap();
+        let mut q = self.buf.lock().unwrap_or_else(|e| e.into_inner());
         q.extend(data.iter().copied());
         let over = q.len().saturating_sub(max);
         if over > 0 {
@@ -931,7 +931,7 @@ impl PlayQueue {
     /// whole frame, since a PA write must be a multiple of the sample-spec frame size.
     fn drain_upto(&self, n: usize, out: &mut Vec<u8>) {
         let fb = self.frame_bytes.load(Ordering::Relaxed);
-        let mut q = self.buf.lock().unwrap();
+        let mut q = self.buf.lock().unwrap_or_else(|e| e.into_inner());
         let mut take = n.min(q.len());
         take -= take % fb;
         out.clear();
@@ -1738,7 +1738,7 @@ fn pa_capture_session_open(
         let p2 = probe.clone();
         let op = context.introspect().get_source_info_by_name(dev, move |res| {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut g = p2.lock().unwrap();
+                let mut g = p2.lock().unwrap_or_else(|e| e.into_inner());
                 match res {
                     ListResult::Item(_) => g.0 = true,
                     ListResult::End | ListResult::Error => g.1 = true,
@@ -1746,7 +1746,7 @@ fn pa_capture_session_open(
             }));
         });
         loop {
-            if probe.lock().unwrap().1 {
+            if probe.lock().unwrap_or_else(|e| e.into_inner()).1 {
                 break;
             }
             if inner.stop_pending() {
@@ -1763,7 +1763,7 @@ fn pa_capture_session_open(
             }
         }
         drop(op);
-        if !probe.lock().unwrap().0 {
+        if !probe.lock().unwrap_or_else(|e| e.into_inner()).0 {
             let msg = format!("PulseAudio source not found: '{dev}'");
             return Err(if device_was_present {
                 // Mid-run: the server was just restarted; its sources are all
@@ -2467,7 +2467,7 @@ impl AudioCapture {
         }
         let shared = &self.shared;
         py.detach(|| {
-            let mut guard = shared.thread.lock().unwrap();
+            let mut guard = shared.thread.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(handle) = guard.take() {
                 inner.request_external_stop();
                 let _ = handle.join();
@@ -2730,7 +2730,7 @@ impl AudioPlayback {
         }
         let shared = &self.shared;
         py.detach(|| {
-            let mut guard = shared.thread.lock().unwrap();
+            let mut guard = shared.thread.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(handle) = guard.take() {
                 inner.request_external_stop();
                 let _ = handle.join();
