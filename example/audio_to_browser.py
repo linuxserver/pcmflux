@@ -44,7 +44,7 @@ SEND_TIMEOUT_SECONDS = 1.0
 # WebSockets are not subject to CORS, so any page a browser visits could otherwise
 # open this socket and listen in. Only the page this server itself hands out may;
 # None keeps non-browser clients, which send no Origin, working.
-ALLOWED_ORIGINS = ["http://localhost:9001", "http://127.0.0.1:9001", None]
+ALLOWED_ORIGINS = ["http://localhost:9001", "http://127.0.0.1:9001", "http://[::1]:9001", None]
 
 async def send_audio_chunks(websocket, queue):
     """Per-client sender: forwards this client's queue to its socket.
