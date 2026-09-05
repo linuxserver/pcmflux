@@ -751,14 +751,30 @@ fn registry() -> &'static Mutex<Vec<Weak<Shared>>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Join the worker `slot` holds, having set the external stop INSIDE the caller's lock
+/// immediately before `join()` — the set-before-join ordering the lost-stop invariant rests on
+/// — and clear `capture_tid` so a later start sees no stale owner. Every stop path ends here.
+fn join_held_worker(slot: &mut Option<JoinHandle<()>>, inner: &Inner) {
+    if let Some(handle) = slot.take() {
+        inner.request_external_stop();
+        let _ = handle.join();
+        inner.capture_tid.store(0, Ordering::Release);
+    }
+}
+
+/// `join_held_worker` behind the lifecycle lock, for the stop paths that want nothing else from
+/// it. A lock poisoned by an unrelated panic is taken anyway: it must never be what leaves a
+/// worker thread running into interpreter finalization.
+fn stop_and_join(slot: &Mutex<Option<JoinHandle<()>>>, inner: &Inner) {
+    join_held_worker(&mut slot.lock().unwrap_or_else(|e| e.into_inner()), inner);
+}
+
 /// Locked takeover + spawn of a worker thread, shared by the capture and playback
 /// starts. Returns the new thread's id, or `None` if the spawn failed.
 ///
 /// Under the lifecycle lock, in order:
 ///
-/// 1. **Stop and join any prior worker**: sets the external stop INSIDE the lock,
-///    immediately before `join()`, then clears `capture_tid` — the set-before-join
-///    ordering that makes the lost-stop invariant hold.
+/// 1. **Stop and join any prior worker** through `join_held_worker`, under this lock.
 /// 2. **Reset the lifecycle state**: clears `stop_state` back to `STOP_NONE` (done ONLY
 ///    here, under the lock, after the join and before the spawn, where no external stop
 ///    can be in flight), forgets the previous run's `last_error`, and arms the startup
@@ -777,11 +793,7 @@ fn spawn_worker(
     body: impl FnOnce() + Send + 'static,
 ) -> Option<ThreadId> {
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(handle) = guard.take() {
-        inner.request_external_stop();
-        let _ = handle.join();
-        inner.capture_tid.store(0, Ordering::Release);
-    }
+    join_held_worker(&mut guard, inner);
     inner.clear_stop();
     inner.clear_error();
     inner.started_ok.store(false, Ordering::Release);
@@ -820,19 +832,14 @@ fn spawn_worker(
 ///
 /// A concurrent start may have already joined this thread and published a live replacement,
 /// which must not be torn down. The guard is an identity check: `ThreadId`s are never reused
-/// within a process, so it cannot false-match. When it does own the slot, the external stop
-/// is set INSIDE the lock before `join()`, matching every other join site (the
-/// set-before-join / lost-stop invariant).
+/// within a process, so it cannot false-match. When it does own the slot, the teardown is
+/// `join_held_worker`'s, like every other stop path.
 fn join_failed_start(slot: &Mutex<Option<JoinHandle<()>>>, inner: &Inner, spawned: ThreadId) {
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     if guard.as_ref().map(|h| h.thread().id()) != Some(spawned) {
         return;
     }
-    if let Some(handle) = guard.take() {
-        inner.request_external_stop();
-        let _ = handle.join();
-        inner.capture_tid.store(0, Ordering::Release);
-    }
+    join_held_worker(&mut guard, inner);
 }
 
 /// Startup handshake shared by the capture and playback starts: with the GIL released,
@@ -2466,14 +2473,7 @@ impl AudioCapture {
             return;
         }
         let shared = &self.shared;
-        py.detach(|| {
-            let mut guard = shared.thread.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(handle) = guard.take() {
-                inner.request_external_stop();
-                let _ = handle.join();
-                inner.capture_tid.store(0, Ordering::Release);
-            }
-        });
+        py.detach(|| stop_and_join(&shared.thread, inner));
     }
 
     /// Set the live Opus target bitrate (bits/s) via the atomic mirror; the capture
@@ -2519,16 +2519,7 @@ impl Drop for AudioCapture {
             return;
         }
         let shared = &self.shared;
-        Python::attach(|py| {
-            py.detach(|| {
-                if let Ok(mut guard) = shared.thread.lock()
-                    && let Some(handle) = guard.take() {
-                        inner.request_external_stop();
-                        let _ = handle.join();
-                        inner.capture_tid.store(0, Ordering::Release);
-                    }
-            });
-        });
+        Python::attach(|py| py.detach(|| stop_and_join(&shared.thread, inner)));
     }
 }
 
@@ -2729,14 +2720,7 @@ impl AudioPlayback {
             return;
         }
         let shared = &self.shared;
-        py.detach(|| {
-            let mut guard = shared.thread.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(handle) = guard.take() {
-                inner.request_external_stop();
-                let _ = handle.join();
-                inner.capture_tid.store(0, Ordering::Release);
-            }
-        });
+        py.detach(|| stop_and_join(&shared.thread, inner));
     }
 
     /// True while a playback worker is connected and running with no stop pending; false
@@ -2770,16 +2754,7 @@ impl Drop for AudioPlayback {
             return;
         }
         let shared = &self.shared;
-        Python::attach(|py| {
-            py.detach(|| {
-                if let Ok(mut guard) = shared.thread.lock()
-                    && let Some(handle) = guard.take() {
-                        inner.request_external_stop();
-                        let _ = handle.join();
-                        inner.capture_tid.store(0, Ordering::Release);
-                    }
-            });
-        });
+        Python::attach(|py| py.detach(|| stop_and_join(&shared.thread, inner)));
     }
 }
 
@@ -2787,9 +2762,8 @@ impl Drop for AudioPlayback {
 /// shutdown, so no worker thread is still calling into Python during finalization.
 ///
 /// Snapshots the two `Weak` registries into strong references (skipping any already
-/// dropped), then for each takes the lifecycle lock, sets the external stop before joining,
-/// and clears the tid — all with the GIL released. Registered on `atexit` from the module
-/// init.
+/// dropped), then hands each to `stop_and_join` with the GIL released. Registered on
+/// `atexit` from the module init.
 #[pyfunction]
 fn _stop_all_captures(py: Python<'_>) {
     let snapshot: Vec<Arc<Shared>> = match registry().lock() {
@@ -2797,34 +2771,47 @@ fn _stop_all_captures(py: Python<'_>) {
         Err(_) => Vec::new(),
     };
     for shared in snapshot {
-        py.detach(|| {
-            if let Ok(mut guard) = shared.thread.lock()
-                && let Some(handle) = guard.take() {
-                    shared.inner.request_external_stop();
-                    let _ = handle.join();
-                    shared.inner.capture_tid.store(0, Ordering::Release);
-                }
-        });
+        py.detach(|| stop_and_join(&shared.thread, &shared.inner));
     }
     let pb_snapshot: Vec<Arc<PbShared>> = match playback_registry().lock() {
         Ok(reg) => reg.iter().filter_map(|w| w.upgrade()).collect(),
         Err(_) => Vec::new(),
     };
     for shared in pb_snapshot {
-        py.detach(|| {
-            if let Ok(mut guard) = shared.thread.lock()
-                && let Some(handle) = guard.take() {
-                    shared.inner.request_external_stop();
-                    let _ = handle.join();
-                    shared.inner.capture_tid.store(0, Ordering::Release);
-                }
-        });
+        py.detach(|| stop_and_join(&shared.thread, &shared.inner));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lifecycle lock poisoned by an unrelated panic must not be what leaves a worker
+    /// thread running into interpreter finalization: `stop_and_join` takes the lock anyway,
+    /// so the handle is still taken and joined. The join itself would hang if the stop were
+    /// not set before it.
+    #[test]
+    fn stop_and_join_takes_a_poisoned_lifecycle_lock() {
+        use std::sync::Arc;
+        let inner = Arc::new(Inner::new());
+        let inner_c = inner.clone();
+        let worker = std::thread::spawn(move || {
+            while !inner_c.stop_pending() {
+                std::thread::yield_now();
+            }
+        });
+        let slot = Arc::new(Mutex::new(Some(worker)));
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        stop_and_join(&slot, &inner);
+        assert!(slot.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert_eq!(inner.capture_tid.load(Ordering::Acquire), 0);
+    }
 
     /// Timestamps that wrap the 32-bit RTP range still decode in order — the
     /// post-rollover frame is not mistaken for an already-played duplicate.
