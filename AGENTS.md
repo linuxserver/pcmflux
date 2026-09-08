@@ -12,12 +12,15 @@ documentation that describe arbitrary code changes of previous states compared t
 explanation. The code commenting should reflect the current state of the codebase and be used to convey information
 to an LLM bot or developer.
 
-Empirical testing is a very useful way to develop this project, and empirical testing is possible for EVERYTHING,
-including implementation, auditing, validation, or verification. A few such options are by utilizing the currently
-installed Firefox and Chrome, as well as the WebKit engine provided by Playwright/Selenium/Puppeteer/Cypress in place
-of Safari, for end-to-end tests. HOWEVER, ask the user for permission to create a test environment (possibly using
-Miniforge; but note that it is likely the system `libgbm.so` should be used for GBM support on NVIDIA and other GPUs)
-and receive directives from the user on how the environment should be constructed and constrained.
+Empirical testing is possible for everything here, including implementation, auditing, validation and verification,
+and every change is validated before it is reported. `cargo test --lib` is the floor, and
+`cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement to quote rather
+than assert. End to end, a change is a wheel (`pip wheel . --no-deps`) installed into a selkies sandbox as the
+Agentic Development section of that repository's `docs/development.md` describes, driven by its audio suites over
+both transports with the installed Firefox and Chrome and Playwright/Selenium/Puppeteer/Cypress WebKit in place of
+Safari. Ask before building an environment on a machine that was not set up for one (Miniforge serves a host with a
+closed package manager) and take the operator's directives on how it is constructed and constrained. Say which checks
+could not run where the hardware for them was not available.
 
 Note that parity between X11 and Wayland, as well as between WebSockets and WebRTC, or between the default dashboard
 and the wish dashboard, is considered a key focus (things that were not wired up correctly on either side, and similar
@@ -26,8 +29,7 @@ across different modes over keeping duplicate code for no reason and more fragil
 you are confident there will be no regressions (or able to validate regressions). Screen coroutine usage in both
 Python and JavaScript, as well as thread usage in all languages, so that everything is performant and does not lead to
 hanging or lagging. Performance preservation or improvements such as zero-copy and latency-reducing measures are
-always important. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher, and CUDA/NVENC 11
-to 13 or higher. Update the translations as well (and write/update additional entries if necessary) as necessary.
+always important. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher.
 A defect that predates the change you are making is still in scope: finding it does not make it someone else's,
 and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is broken, what you ruled out, and
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
