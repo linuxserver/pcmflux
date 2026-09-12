@@ -314,7 +314,6 @@ async def main_async():
         "SELKIES_AUDIO_DEVICE_NAME",
         "alsa_output.pci-0000_2b_00.1.hdmi-stereo.monitor",
     ).encode("utf-8")
-    #g_settings.device_name = None
     g_settings.sample_rate = 48000
     g_settings.channels = int(os.environ.get("SELKIES_AUDIO_CHANNELS", "2"))
     g_settings.opus_bitrate = int(os.environ.get("SELKIES_AUDIO_BITRATE", "128000"))

@@ -801,8 +801,7 @@ fn spawn_worker(
     let t_inner = inner.clone();
     match std::thread::Builder::new().name(name.into()).spawn(move || {
         unsafe {
-            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-            let _ = libc::setpriority(libc::PRIO_PROCESS, tid, -15);
+            let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -15);
         }
         t_inner.capture_tid.store(gettid(), Ordering::Release);
         // A worker panic must flip the liveness contract (started_ok/start_state):
@@ -1882,8 +1881,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         .name("pcmflux-deliver".into())
         .spawn(move || {
             unsafe {
-                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
-                let _ = libc::setpriority(libc::PRIO_PROCESS, tid, -10);
+                let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -10);
             }
             deliver_inner.deliver_tid.store(gettid(), Ordering::Release);
             while let Some((data, pts)) = deliver_ring.pop() {
