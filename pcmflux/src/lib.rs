@@ -2921,6 +2921,18 @@ mod tests {
         }
     }
 
+    /// The Opus rates, refused up front rather than at encoder creation: 44.1 kHz is the
+    /// one a caller reaches for that Opus has never run at.
+    #[test]
+    fn opus_sample_rates() {
+        for rate in [8000, 12000, 16000, 24000, 48000] {
+            assert!(check_opus_sample_rate(rate).is_ok());
+        }
+        for rate in [0, 11025, 22050, 44100, 96000] {
+            assert!(check_opus_sample_rate(rate).is_err());
+        }
+    }
+
     /// The samples-per-channel and PCM-byte arithmetic matches the wire cases:
     /// 48 kHz / 20 ms / stereo is 960 samples/ch and 3840 bytes, and 24 kHz / 10 ms / mono
     /// is 240 samples and 480 bytes.
