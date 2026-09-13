@@ -14,10 +14,10 @@ This package builds a native Rust extension (via `setuptools-rust`/PyO3). It req
 
 On Debian/Ubuntu, you can install them with:
 ```bash
-sudo apt-get install libpulse-dev libopus-dev
+sudo apt-get install libpulse-dev cmake build-essential
 ```
 
-If the system `libopus` is not found, the build falls back to compiling a bundled copy of opus via `cmake`; in that case `cmake` and a C compiler (`build-essential`) are additionally required.
+The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and is linked statically, so `cmake` and a C compiler are always required and no system `libopus` is used.
 
 ## Core Features
 

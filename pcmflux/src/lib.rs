@@ -55,7 +55,6 @@ use pulse::mainloop::standard::Mainloop;
 use pulse::stream::{FlagSet as StreamFlags, PeekResult, Stream};
 use pulse::time::MicroSeconds;
 
-use opus::{Application, Channels};
 
 /// Non-panicking `println!` replacement that swallows write errors (e.g. EPIPE) instead
 /// of panicking, so a broken output pipe can't unwind the capture thread or a callback.
@@ -960,7 +959,7 @@ impl PlayQueue {
 /// stay off the per-decode allocation path. Lives behind a `Mutex` on `PbShared` and is
 /// driven from `write` / `write_red`.
 struct OpusPlaybackDecoder {
-    dec: opus::Decoder,
+    dec: OpusDec,
     channels: usize,
     pcm: Vec<i16>,
     /// Inbound scratch for a buffer-protocol payload, copied here under the GIL so the
@@ -972,12 +971,38 @@ struct OpusPlaybackDecoder {
     last_ts: Option<i64>,
 }
 
+/// Owning wrapper over a raw `OpusDecoder`.
+///
+/// The pointer is only touched from the thread holding the enclosing `Mutex`, which is what
+/// makes the `unsafe impl Send` sound; `Drop` destroys the C decoder.
+struct OpusDec {
+    st: *mut opusic_sys::OpusDecoder,
+}
+
+unsafe impl Send for OpusDec {}
+
+impl Drop for OpusDec {
+    fn drop(&mut self) {
+        unsafe { opusic_sys::opus_decoder_destroy(self.st) }
+    }
+}
+
 impl OpusPlaybackDecoder {
     /// Create a mono/stereo Opus decoder for the mic uplink; `None` if creation
     /// fails. `channels <= 1` decodes as mono, otherwise stereo.
     fn new(sample_rate: u32, channels: i32) -> Option<Self> {
-        let ch = if channels <= 1 { Channels::Mono } else { Channels::Stereo };
-        let dec = opus::Decoder::new(sample_rate, ch).ok()?;
+        let mut err = 0;
+        let st = unsafe {
+            opusic_sys::opus_decoder_create(
+                sample_rate as i32,
+                if channels <= 1 { 1 } else { 2 },
+                &mut err,
+            )
+        };
+        if st.is_null() || err != 0 {
+            return None;
+        }
+        let dec = OpusDec { st };
         Some(OpusPlaybackDecoder {
             dec,
             channels: channels.max(1) as usize,
@@ -1004,8 +1029,20 @@ impl OpusPlaybackDecoder {
         if self.pcm.len() < cap {
             self.pcm.resize(cap, 0);
         }
-        let samples = self.dec.decode(packet, &mut self.pcm[..cap], false).ok()?;
-        let n = samples * self.channels;
+        let samples = unsafe {
+            opusic_sys::opus_decode(
+                self.dec.st,
+                packet.as_ptr(),
+                packet.len() as i32,
+                self.pcm.as_mut_ptr(),
+                (cap / self.channels) as i32,
+                0,
+            )
+        };
+        if samples < 0 {
+            return None;
+        }
+        let n = samples as usize * self.channels;
         Some(bytemuck::cast_slice(&self.pcm[..n]))
     }
 
@@ -1149,11 +1186,26 @@ fn multiopus_layout(channels: i32) -> Option<(i32, i32, &'static [u8])> {
     }
 }
 
-/// One encode surface over both Opus APIs: the `opus` crate for mono/stereo, and
-/// the raw multistream C API for 6/8-channel surround.
+/// One encode surface over both Opus APIs: the single-stream C encoder for mono/stereo, and
+/// the multistream one for 6/8-channel surround.
 enum PcmEncoder {
-    Stereo(opus::Encoder),
+    Stereo(MonoOpus),
     Multi(MultiOpus),
+}
+
+/// Owning wrapper over a raw `OpusEncoder` (the mono/stereo single-stream encoder).
+///
+/// Owned by the capture thread exactly as `MultiOpus` is; `Drop` destroys the C encoder.
+struct MonoOpus {
+    st: *mut opusic_sys::OpusEncoder,
+}
+
+unsafe impl Send for MonoOpus {}
+
+impl Drop for MonoOpus {
+    fn drop(&mut self) {
+        unsafe { opusic_sys::opus_encoder_destroy(self.st) }
+    }
 }
 
 /// Owning wrapper over a raw `OpusMSEncoder` (the surround multistream encoder).
@@ -1162,37 +1214,49 @@ enum PcmEncoder {
 /// `RunState`, which is what makes the `unsafe impl Send` below sound; `Drop` destroys the
 /// C encoder.
 struct MultiOpus {
-    st: *mut audiopus_sys::OpusMSEncoder,
+    st: *mut opusic_sys::OpusMSEncoder,
 }
 
 unsafe impl Send for MultiOpus {}
 
 impl Drop for MultiOpus {
     fn drop(&mut self) {
-        unsafe { audiopus_sys::opus_multistream_encoder_destroy(self.st) }
+        unsafe { opusic_sys::opus_multistream_encoder_destroy(self.st) }
     }
 }
 
 impl PcmEncoder {
     /// Build the Opus encoder for a channel count, selecting the API by width.
     ///
-    /// - **Mono/stereo** (`channels <= 2`): the safe `opus` crate encoder in `LowDelay`
-    ///   application mode; a failure to apply the initial bitrate or VBR mode is logged but
-    ///   not fatal.
+    /// - **Mono/stereo** (`channels <= 2`): the single-stream C encoder in
+    ///   `RESTRICTED_LOWDELAY`; a failure to apply the initial bitrate or VBR mode is logged
+    ///   but not fatal.
     /// - **Surround** (6/8): the raw multistream C encoder created from `multiopus_layout`
     ///   in `RESTRICTED_LOWDELAY`; an unsupported channel count is a hard error.
     ///
     /// Bitrate and VBR are applied at creation and can be retuned live via `set_bitrate`.
     fn new(sample_rate: u32, channels: i32, vbr: bool, bitrate: i32) -> Result<Self, String> {
         if channels <= 2 {
-            let ch = if channels == 1 { Channels::Mono } else { Channels::Stereo };
-            let mut enc = opus::Encoder::new(sample_rate, ch, Application::LowDelay)
-                .map_err(|e| format!("opus_encoder_create() failed: {e:?}"))?;
-            if let Err(e) = enc.set_bitrate(opus::Bitrate::Bits(bitrate)) {
-                elog!("[pcmflux] WARNING: failed to apply initial bitrate: {e:?}");
+            let mut err = 0;
+            let st = unsafe {
+                opusic_sys::opus_encoder_create(
+                    sample_rate as i32,
+                    if channels == 1 { 1 } else { 2 },
+                    opusic_sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+                    &mut err,
+                )
+            };
+            if st.is_null() || err != 0 {
+                return Err(format!("opus_encoder_create() failed: {err}"));
             }
-            if let Err(e) = enc.set_vbr(vbr) {
-                elog!("[pcmflux] WARNING: failed to apply VBR mode: {e:?}");
+            let enc = MonoOpus { st };
+            unsafe {
+                if opusic_sys::opus_encoder_ctl(st, opusic_sys::OPUS_SET_BITRATE_REQUEST, bitrate) != 0 {
+                    elog!("[pcmflux] WARNING: failed to apply initial bitrate");
+                }
+                if opusic_sys::opus_encoder_ctl(st, opusic_sys::OPUS_SET_VBR_REQUEST, i32::from(vbr)) != 0 {
+                    elog!("[pcmflux] WARNING: failed to apply VBR mode");
+                }
             }
             return Ok(PcmEncoder::Stereo(enc));
         }
@@ -1200,29 +1264,29 @@ impl PcmEncoder {
             .ok_or_else(|| format!("unsupported surround channel count {channels}"))?;
         unsafe {
             let mut err: i32 = 0;
-            let st = audiopus_sys::opus_multistream_encoder_create(
+            let st = opusic_sys::opus_multistream_encoder_create(
                 sample_rate as i32,
                 channels,
                 streams,
                 coupled,
                 mapping.as_ptr(),
-                audiopus_sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+                opusic_sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
                 &mut err,
             );
             if st.is_null() || err != 0 {
                 return Err(format!("opus_multistream_encoder_create() failed: {err}"));
             }
-            if audiopus_sys::opus_multistream_encoder_ctl(
+            if opusic_sys::opus_multistream_encoder_ctl(
                 st,
-                audiopus_sys::OPUS_SET_BITRATE_REQUEST,
+                opusic_sys::OPUS_SET_BITRATE_REQUEST,
                 bitrate,
             ) != 0
             {
                 elog!("[pcmflux] WARNING: failed to apply initial surround bitrate");
             }
-            if audiopus_sys::opus_multistream_encoder_ctl(
+            if opusic_sys::opus_multistream_encoder_ctl(
                 st,
-                audiopus_sys::OPUS_SET_VBR_REQUEST,
+                opusic_sys::OPUS_SET_VBR_REQUEST,
                 vbr as i32,
             ) != 0
             {
@@ -1243,11 +1307,22 @@ impl PcmEncoder {
         out: &mut [u8],
     ) -> Result<usize, String> {
         match self {
-            PcmEncoder::Stereo(enc) => enc
-                .encode(pcm, out)
-                .map_err(|e| format!("opus_encode() failed: {e:?}")),
+            PcmEncoder::Stereo(enc) => unsafe {
+                let n = opusic_sys::opus_encode(
+                    enc.st,
+                    pcm.as_ptr(),
+                    frame_size_per_channel as i32,
+                    out.as_mut_ptr(),
+                    out.len() as i32,
+                );
+                if n < 0 {
+                    Err(format!("opus_encode() failed: {n}"))
+                } else {
+                    Ok(n as usize)
+                }
+            },
             PcmEncoder::Multi(ms) => unsafe {
-                let n = audiopus_sys::opus_multistream_encode(
+                let n = opusic_sys::opus_multistream_encode(
                     ms.st,
                     pcm.as_ptr(),
                     frame_size_per_channel as i32,
@@ -1267,12 +1342,20 @@ impl PcmEncoder {
     /// The encoder's look-ahead in input samples: what a decoder discards first.
     fn lookahead(&mut self) -> i32 {
         match self {
-            PcmEncoder::Stereo(enc) => enc.get_lookahead().unwrap_or(0),
+            PcmEncoder::Stereo(enc) => unsafe {
+                let mut value: i32 = 0;
+                let ret = opusic_sys::opus_encoder_ctl(
+                    enc.st,
+                    opusic_sys::OPUS_GET_LOOKAHEAD_REQUEST,
+                    &mut value as *mut i32,
+                );
+                if ret == 0 { value } else { 0 }
+            },
             PcmEncoder::Multi(ms) => unsafe {
                 let mut value: i32 = 0;
-                let ret = audiopus_sys::opus_multistream_encoder_ctl(
+                let ret = opusic_sys::opus_multistream_encoder_ctl(
                     ms.st,
-                    audiopus_sys::OPUS_GET_LOOKAHEAD_REQUEST,
+                    opusic_sys::OPUS_GET_LOOKAHEAD_REQUEST,
                     &mut value as *mut i32,
                 );
                 if ret == 0 { value } else { 0 }
@@ -1282,13 +1365,18 @@ impl PcmEncoder {
 
     fn set_bitrate(&mut self, bits: i32) -> Result<(), String> {
         match self {
-            PcmEncoder::Stereo(enc) => enc
-                .set_bitrate(opus::Bitrate::Bits(bits))
-                .map_err(|e| format!("{e:?}")),
+            PcmEncoder::Stereo(enc) => unsafe {
+                let ret = opusic_sys::opus_encoder_ctl(enc.st, opusic_sys::OPUS_SET_BITRATE_REQUEST, bits);
+                if ret != 0 {
+                    Err(format!("ctl error {ret}"))
+                } else {
+                    Ok(())
+                }
+            },
             PcmEncoder::Multi(ms) => unsafe {
-                let ret = audiopus_sys::opus_multistream_encoder_ctl(
+                let ret = opusic_sys::opus_multistream_encoder_ctl(
                     ms.st,
-                    audiopus_sys::OPUS_SET_BITRATE_REQUEST,
+                    opusic_sys::OPUS_SET_BITRATE_REQUEST,
                     bits,
                 );
                 if ret != 0 {
@@ -2932,7 +3020,7 @@ mod tests {
         unsafe {
             let (streams, coupled, mapping) = multiopus_layout(channels as i32).unwrap();
             let mut err = 0;
-            let dec = audiopus_sys::opus_multistream_decoder_create(
+            let dec = opusic_sys::opus_multistream_decoder_create(
                 48000,
                 channels as i32,
                 streams,
@@ -2942,7 +3030,7 @@ mod tests {
             );
             assert!(!dec.is_null() && err == 0, "decoder create failed: {err}");
             let mut decoded = vec![0i16; frame * channels];
-            let got = audiopus_sys::opus_multistream_decode(
+            let got = opusic_sys::opus_multistream_decode(
                 dec,
                 out.as_ptr(),
                 n as i32,
@@ -2950,7 +3038,7 @@ mod tests {
                 frame as i32,
                 0,
             );
-            audiopus_sys::opus_multistream_decoder_destroy(dec);
+            opusic_sys::opus_multistream_decoder_destroy(dec);
             assert_eq!(got, frame as i32, "decode length mismatch");
             let mut rms = vec![0f64; channels];
             for i in 0..frame {
@@ -3092,14 +3180,14 @@ mod tests {
     /// Test helper: `n` distinct valid 20 ms mono Opus packets at 24 kHz
     /// (480 samples/frame).
     fn opus_frames(n: usize) -> Vec<Vec<u8>> {
-        let mut enc = opus::Encoder::new(24000, Channels::Mono, Application::LowDelay).unwrap();
+        let mut enc = PcmEncoder::new(24000, 1, true, 24000).unwrap();
         (0..n)
             .map(|s| {
                 let pcm: Vec<i16> = (0..480)
                     .map(|k| ((k * (s as i32 + 1)) % 4000 - 2000) as i16)
                     .collect();
                 let mut out = vec![0u8; 4000];
-                let len = enc.encode(&pcm, &mut out).unwrap();
+                let len = enc.encode(&pcm, 480, &mut out).unwrap();
                 out.truncate(len);
                 out
             })

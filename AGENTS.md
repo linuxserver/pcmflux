@@ -46,7 +46,7 @@ straight to `main`, whatever standing permission to push `main` exists. An optio
 (a protocol a compositor advertises, a driver feature, a device) is taken only when its presence is detected and never
 as the default: that it is exposed is not proof it works, and a reviewer has to be able to tell what runs where.
 
-`LICENSES.md` inventories the crates and the linked libpulse (LGPL-2.1-or-later) and libopus (BSD-3-Clause);
+`LICENSES.md` inventories the crates, the linked libpulse (LGPL-2.1-or-later) and the statically linked libopus (BSD-3-Clause);
 `pcmflux/deny.toml` keeps the crate graph permissive (the `Licenses` workflow runs it). A new crate that links
 native code gets a row there.
 
