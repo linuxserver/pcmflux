@@ -46,6 +46,8 @@ an empty frame, so there's no silence to filter out. The `frame` is a zero-copy
 Copy it out with `bytes(frame)` if it must outlive the callback, or pass
 `memoryview(frame)` for a zero-copy hand-off (keep the frame referenced for the
 duration of the send so its buffer stays alive).
+With no callback the capture serves only its `output_socket` (below) and no
+frame reaches Python.
 
 ```python
 from pcmflux import AudioCapture, AudioCaptureSettings
@@ -107,6 +109,19 @@ To run the example:
 3.  Open `http://localhost:9001` in a modern web browser (Chrome, Edge, etc.).
 
 The example client (`index.html`) strips the 2-byte `[0x01, 0x00]` header before decoding, and its `FRAME_DURATION_US` constant must match the server's `frame_duration_ms` (the value is not announced over the wire).
+
+## Ogg Opus Output Socket
+
+`output_socket` names a Unix socket the capture serves its packets on as a standard Ogg Opus stream, to every consumer that connects: the `OpusHead` and `OpusTags` pages first, then one page per packet with the 48 kHz granule position. A consumer that stops reading is dropped, never waited on.
+
+```python
+settings.output_socket = "/run/user/1000/audio.sock"
+AudioCapture().start_capture(settings)  # socket only: no callback, no Python per frame
+```
+
+```bash
+ffmpeg -i unix:/run/user/1000/audio.sock -c:a copy capture.opus
+```
 
 ## Development
 

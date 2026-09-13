@@ -73,6 +73,8 @@ macro_rules! elog {
     }};
 }
 
+mod ogg_sink;
+
 /// Returns the calling thread's OS tid (`gettid` syscall) so a stop/start issued from
 /// inside the Python callback can detect it is on the capture thread and avoid self-joining.
 #[inline]
@@ -285,6 +287,7 @@ struct Settings {
     latency_ms: i32,
     omit_audio_header: bool,
     red_distance: i32,
+    output_socket: String,
 }
 
 /// True if `ms` is a valid Opus frame duration (2.5, 5, 10, 20, 40, or 60 ms).
@@ -344,6 +347,7 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
         latency_ms: s.getattr("latency_ms")?.extract()?,
         omit_audio_header: s.getattr("omit_audio_header")?.extract()?,
         red_distance: s.getattr("red_distance")?.extract::<i32>()?.clamp(0, RED_MAX_DISTANCE),
+        output_socket: s.getattr("output_socket")?.extract()?,
     };
     check_opus_sample_rate(parsed.sample_rate)?;
     if !valid_opus_duration(parsed.frame_duration_ms) {
@@ -451,6 +455,10 @@ struct AudioCaptureSettings {
     omit_audio_header: bool,
     #[pyo3(get, set)]
     red_distance: i32,
+    /// Unix socket path on which the capture serves its packets as an Ogg Opus stream to
+    /// every consumer that connects; empty serves none.
+    #[pyo3(get, set)]
+    output_socket: String,
 }
 
 #[pymethods]
@@ -469,6 +477,7 @@ impl AudioCaptureSettings {
             latency_ms: 0,
             omit_audio_header: false,
             red_distance: 0,
+            output_socket: String::new(),
         }
     }
 }
@@ -1255,6 +1264,22 @@ impl PcmEncoder {
     }
 
     /// Retune the encoder's target bitrate live (bits/s), for either API.
+    /// The encoder's look-ahead in input samples: what a decoder discards first.
+    fn lookahead(&mut self) -> i32 {
+        match self {
+            PcmEncoder::Stereo(enc) => enc.get_lookahead().unwrap_or(0),
+            PcmEncoder::Multi(ms) => unsafe {
+                let mut value: i32 = 0;
+                let ret = audiopus_sys::opus_multistream_encoder_ctl(
+                    ms.st,
+                    audiopus_sys::OPUS_GET_LOOKAHEAD_REQUEST,
+                    &mut value as *mut i32,
+                );
+                if ret == 0 { value } else { 0 }
+            },
+        }
+    }
+
     fn set_bitrate(&mut self, bits: i32) -> Result<(), String> {
         match self {
             PcmEncoder::Stereo(enc) => enc
@@ -1307,16 +1332,18 @@ impl DeliveryRing {
 
     /// Enqueue one encoded frame, dropping the oldest (and bumping `dropped`) if the
     /// ring is at capacity, then wake the consumer. A no-op once closed.
-    fn push(&self, data: Vec<u8>, pts: u64) {
+    fn push(&self, data: Vec<u8>, pts: u64) -> Option<Vec<u8>> {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(q) = g.as_mut() {
-            if q.len() >= self.capacity {
-                q.pop_front();
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            q.push_back((data, pts));
-            self.cv.notify_one();
+        let Some(q) = g.as_mut() else {
+            return Some(data);
+        };
+        if q.len() >= self.capacity {
+            q.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+        q.push_back((data, pts));
+        self.cv.notify_one();
+        None
     }
 
     /// Block until a frame is available and return it, or return `None` once the ring
@@ -1335,7 +1362,8 @@ impl DeliveryRing {
     }
 
     /// Close the ring: drop any queued frames and wake every waiter so `pop` returns
-    /// `None`. Called during capture teardown to join the delivery thread.
+    /// `None`, and hand every later `push` its buffer back. Called during capture teardown
+    /// to join the delivery thread, and up front by a run that has no callback.
     fn close(&self) {
         *self.q.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.cv.notify_all();
@@ -1494,6 +1522,10 @@ struct RunState<'a> {
     red_spare: Vec<Vec<u8>>,
     red_distance: usize,
     total_samples_processed: u64,
+    /// The Ogg Opus stream on the output socket, and the 48 kHz samples one input
+    /// sample is worth for its granule positions.
+    ogg: Option<ogg_sink::OggSink>,
+    ogg_scale: u64,
     first_sound_detected: bool,
     current_applied_bitrate: i32,
     chunks_read: u64,
@@ -1621,6 +1653,9 @@ impl<'a> RunState<'a> {
         }
         self.chunks_encoded += 1;
         self.bytes_encoded += encoded as u64;
+        if let Some(sink) = self.ogg.as_mut() {
+            sink.write_packet(&data[prefix..prefix + encoded], self.total_samples_processed * self.ogg_scale);
+        }
         if self.red_distance > 0 {
             let mut slot = if self.red_history.len() >= self.red_distance {
                 self.red_history.pop_front().map(|(v, _)| v).unwrap_or_default()
@@ -1633,7 +1668,9 @@ impl<'a> RunState<'a> {
         }
         data.truncate(prefix + encoded);
 
-        self.ring.push(data, pts);
+        if let Some(data) = self.ring.push(data, pts) {
+            self.pool.put(data);
+        }
     }
 }
 
@@ -1663,7 +1700,9 @@ impl<'a> RunState<'a> {
 ///    runs the Python callback there, so GIL stalls cannot back up the PA pump; a callback
 ///    error is reported as an unraisable exception and never propagates into the loop. The
 ///    buffer pool is sized to the worst-case body — RED prefix plus a max Opus packet, scaled
-///    by stream count for surround (one self-delimited packet per stream).
+///    by stream count for surround (one self-delimited packet per stream). A run without a
+///    callback spawns no delivery thread: its ring starts closed, so every encoded frame goes
+///    back to the pool and only the output socket is served.
 /// 6. **Hot loop**: `pump`s on the ~20 ms bound, then drains every buffered fragment via
 ///    peek/discard (a `Hole` is an xrun — the read index is just advanced), feeding each into
 ///    `RunState`. A stop is observed within the pump bound even when the source is wedged. On
@@ -1818,7 +1857,7 @@ fn pa_capture_session_open(
     })
 }
 
-fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
+fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyAny>>) {
     inner.opus_bitrate.store(settings.opus_bitrate, Ordering::Relaxed);
     inner.use_silence_gate.store(settings.use_silence_gate, Ordering::Relaxed);
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
@@ -1873,48 +1912,65 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         .map_or(1, |(streams, _, _)| streams as usize)
         * MAX_OPUS_PACKET;
     let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + max_pkt));
-    let deliver_ring = Arc::clone(&ring);
-    let deliver_pool = Arc::clone(&pool);
-    let deliver_inner = Arc::clone(inner);
-    let deliver_cb: Py<PyAny> = Python::attach(|py| callback.clone_ref(py));
-    let spawned = std::thread::Builder::new()
-        .name("pcmflux-deliver".into())
-        .spawn(move || {
-            unsafe {
-                let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -10);
-            }
-            deliver_inner.deliver_tid.store(gettid(), Ordering::Release);
-            while let Some((data, pts)) = deliver_ring.pop() {
-                Python::attach(|py| {
-                    let frame = match Py::new(
-                        py,
-                        AudioFrame { data, pts, pool: Some(Arc::clone(&deliver_pool)) },
-                    ) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            elog!("[pcmflux] AudioFrame alloc failed: {e:?}");
-                            return;
-                        }
-                    };
-                    if let Err(e) = deliver_cb.call1(py, (frame,)) {
-                        e.write_unraisable(py, Some(deliver_cb.bind(py)));
+    let delivery = match callback {
+        None => {
+            ring.close();
+            None
+        }
+        Some(callback) => {
+            let deliver_ring = Arc::clone(&ring);
+            let deliver_pool = Arc::clone(&pool);
+            let deliver_inner = Arc::clone(inner);
+            let deliver_cb: Py<PyAny> = Python::attach(|py| callback.clone_ref(py));
+            let spawned = std::thread::Builder::new()
+                .name("pcmflux-deliver".into())
+                .spawn(move || {
+                    unsafe {
+                        let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -10);
                     }
+                    deliver_inner.deliver_tid.store(gettid(), Ordering::Release);
+                    while let Some((data, pts)) = deliver_ring.pop() {
+                        Python::attach(|py| {
+                            let frame = match Py::new(
+                                py,
+                                AudioFrame { data, pts, pool: Some(Arc::clone(&deliver_pool)) },
+                            ) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    elog!("[pcmflux] AudioFrame alloc failed: {e:?}");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = deliver_cb.call1(py, (frame,)) {
+                                e.write_unraisable(py, Some(deliver_cb.bind(py)));
+                            }
+                        });
+                    }
+                    deliver_inner.deliver_tid.store(0, Ordering::Release);
                 });
+            match spawned {
+                Ok(join) => Some(DeliveryThread {
+                    ring: Arc::clone(&ring),
+                    inner,
+                    join: Some(join),
+                }),
+                Err(e) => {
+                    inner.fail(format!("delivery thread spawn failed: {e}"));
+                    return;
+                }
             }
-            deliver_inner.deliver_tid.store(0, Ordering::Release);
-        });
-    let delivery = match spawned {
-        Ok(join) => DeliveryThread {
-            ring: Arc::clone(&ring),
-            inner,
-            join: Some(join),
-        },
-        Err(e) => {
-            inner.fail(format!("delivery thread spawn failed: {e}"));
-            return;
         }
     };
 
+    let ogg_scale = 48_000 / settings.sample_rate.max(1) as u64;
+    let mut encoder = encoder;
+    let ogg = ogg_sink::OggSink::try_bind(&settings.output_socket, &ogg_sink::OpusHead {
+        channels: channels as u8,
+        pre_skip: (encoder.lookahead().max(0) as u64 * ogg_scale).min(u16::MAX as u64) as u16,
+        input_sample_rate: settings.sample_rate,
+        mapping: multiopus_layout(channels as i32)
+            .map(|(streams, coupled, table)| (streams as u8, coupled as u8, table.to_vec())),
+    });
     let mut run = RunState {
         inner,
         ring: &ring,
@@ -1929,6 +1985,8 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: &Py<PyAny>) {
         red_spare: Vec::new(),
         red_distance: settings.red_distance.max(0) as usize,
         total_samples_processed: 0,
+        ogg,
+        ogg_scale,
         first_sound_detected: false,
         current_applied_bitrate: settings.opus_bitrate,
         chunks_read: 0,
@@ -2391,7 +2449,8 @@ impl AudioCapture {
         }
     }
 
-    /// Start (or restart) audio capture, delivering encoded frames to `callback`.
+    /// Start (or restart) audio capture, delivering encoded frames to `callback`; with no
+    /// callback the run serves only its `output_socket` and no frame ever reaches Python.
     ///
     /// 1. **Re-entrancy guard**: if called on one of the run's own threads — the delivery
     ///    thread (where the Python callback actually executes) or the capture thread — it
@@ -2413,11 +2472,12 @@ impl AudioCapture {
     ///    is observed through `state` / `last_error`. On `FAILED`, `join_failed_start` tears
     ///    down ONLY the thread this call spawned (identity-checked) — a concurrent start may
     ///    already own the slot with a live run that must survive — and `last_error` is raised.
+    #[pyo3(signature = (settings, callback = None))]
     fn start_capture(
         &self,
         py: Python<'_>,
         settings: &Bound<'_, PyAny>,
-        callback: Py<PyAny>,
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         let inner = self.inner().clone();
 
@@ -2432,7 +2492,7 @@ impl AudioCapture {
         let shared = &self.shared;
         let inner_ref = &inner;
         let t_inner = inner.clone();
-        let body = move || capture_run(&t_inner, &parsed, &callback);
+        let body = move || capture_run(&t_inner, &parsed, callback.as_ref());
         let spawned =
             py.detach(move || spawn_worker(&shared.thread, inner_ref, "pcmflux-capture", body));
         let my_thread = match spawned {
