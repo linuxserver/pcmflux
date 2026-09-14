@@ -24,6 +24,7 @@ setup(
             "pcmflux",
             "pcmflux/Cargo.toml",
             binding=Binding.PyO3,
+            features=["extension-module"],
             debug=False,
             strip=Strip.All,
         )
