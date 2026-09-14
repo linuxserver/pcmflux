@@ -15,8 +15,10 @@ to an LLM bot or developer.
 Empirical testing is possible for everything here, including implementation, auditing, validation and verification,
 and every change is validated before it is reported. `cargo test --lib` is the floor, and
 `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement to quote rather
-than assert. End to end, a change is a wheel (`pip wheel . --no-deps`) installed into a selkies sandbox as the
-Agentic Development section of that repository's `docs/development.md` describes, driven by its audio suites over
+than assert. The test binary links the interpreter because pyo3's `extension-module` is a crate feature the Python
+build alone asks for (`features` on the `RustExtension` in `setup.py`); putting it back on the pyo3 dependency itself
+would leave `cargo test` unable to link. End to end, a change is a wheel (`pip wheel . --no-deps`) installed into a
+selkies sandbox as the Agentic Development section of that repository's `docs/development.md` describes, driven by its audio suites over
 both transports with the installed Firefox and Chrome and Playwright/Selenium/Puppeteer/Cypress WebKit in place of
 Safari. Ask before building an environment on a machine that was not set up for one (Miniforge serves a host with a
 closed package manager) and take the operator's directives on how it is constructed and constrained. Say which checks
