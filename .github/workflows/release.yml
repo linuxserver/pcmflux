@@ -1,9 +1,10 @@
 name: Release
 
 # A tag push releases that tag, which is the version the wheels carry: a
-# pre-release such as 2.2.0rc1 is released as one. A manual run releases the tag
-# it names and can hold the release off the "Latest" badge, for a fix to an
-# older series.
+# pre-release such as 2.1.0rc1 is released as one while a release holds the
+# "Latest" badge, and as the latest release while a pre-release does, so a
+# release candidate follows the one before it. A manual run releases the tag it
+# names and can hold the release off the badge, for a fix to an older series.
 
 on:
   push:
@@ -12,11 +13,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build and publish, tagging this run's commit when it is new (e.g. 2.1.0 or 2.2.0rc1)
+        description: Release tag to build and publish, tagging this run's commit when it is new (e.g. 2.1.0 or 2.1.0rc1)
         type: string
         required: true
       latest:
-        description: Designate this release as the latest
+        description: Designate this release as the latest when a release of its kind is; off holds the badge back
         type: boolean
         default: true
 
@@ -41,7 +42,7 @@ jobs:
         # anything is created under that name
         run: |
           echo "${RELEASE_TAG}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+|\.post[0-9]+|\.dev[0-9]+)?$' \
-            || { echo "::error::${RELEASE_TAG} is not a PEP 440 version (2.1.0, 2.2.0rc1)"; exit 1; }
+            || { echo "::error::${RELEASE_TAG} is not a PEP 440 version (2.1.0, 2.1.0rc1)"; exit 1; }
 
       - name: Tag the commit this run started from
         # A manual run names the release, so a tag it does not find yet is
@@ -148,16 +149,19 @@ jobs:
       - name: Classify the tag
         id: kind
         env:
+          GH_TOKEN: ${{ github.token }}
           LATEST: ${{ inputs.latest }}
         run: |
-          # A pre-release tag never takes the "Latest release" badge; a release
-          # takes it unless a manual run holds it back
+          # A release takes the "Latest release" badge, and a pre-release while
+          # the release holding it is one too, unless a manual run holds it
+          # back; GitHub gives the badge to no pre-release, so one that takes
+          # it is marked as a release
+          is_prerelease() { echo "$1" | grep -qE '((a|b|rc)|\.dev)[0-9]+$'; }
+          holder="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
           latest=true
-          if [ "${LATEST}" = "false" ]; then latest=false; fi
-          case "${RELEASE_TAG}" in
-            *[ab]*|*rc*|*dev*) prerelease=true; latest=false ;;
-            *) prerelease=false ;;
-          esac
+          if [ "${LATEST}" = "false" ] || { is_prerelease "${RELEASE_TAG}" && ! is_prerelease "${holder}"; }; then latest=false; fi
+          prerelease=false
+          if [ "${latest}" = false ] && is_prerelease "${RELEASE_TAG}"; then prerelease=true; fi
           {
             echo "prerelease=${prerelease}"
             echo "make_latest=${latest}"
