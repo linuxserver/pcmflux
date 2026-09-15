@@ -36,7 +36,7 @@ jobs:
           name: wheels-${{ matrix.target.arch }}-${{ matrix.platform }}
           path: wheelhouse/*.whl
           # A wheel is a deflated zip already, so the archive this is wrapped in
-          # cannot compress it further: levelling off spends no CPU re-deflating
+          # cannot compress it further: leveling off spends no CPU re-deflating
           # it for a size that does not move.
           compression-level: 0
 

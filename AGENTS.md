@@ -10,7 +10,8 @@ not too verbose (do not add comments more fit for a PR summary than a comment). 
 as issue or task numbers) in the code or documentation. Do not use inline comments. Do not use comments or
 documentation that describe arbitrary code changes of previous states compared to the current code that do not need
 explanation. The code commenting should reflect the current state of the codebase and be used to convey information
-to an LLM bot or developer.
+to an LLM bot or developer. Write American English -- color, behavior, center, initialize, canceled -- except
+where a name belongs to something upstream, such as a Wayland `Cancelled` event or an NVENC `colourMatrix` field.
 
 Empirical testing is possible for everything here, including implementation, auditing, validation and verification,
 and every change is validated before it is reported. `cargo test --lib` is the floor, and
@@ -38,10 +39,10 @@ what you would do next. The same applies to a failure you cannot reproduce yet -
 fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
 A change is ready when four questions have answers, and the commit or pull request gives them to the reviewer:
-was the defect, or the missing behaviour, reproduced on the code before the change (a failing check or a measurement
+was the defect, or the missing behavior, reproduced on the code before the change (a failing check or a measurement
 on the old tree, not an argument from the source); is it gone, or present, on the exact code being committed, through
 the path a user takes rather than a switch a user would never flip (a developer toggle, a debug key, a knob of the
-rig); can the change affect behaviour it was not aimed at, and what was run to know; and is the change stripped to what
+rig); can the change affect behavior it was not aimed at, and what was run to know; and is the change stripped to what
 makes it work, since every line the first two answers do not need is noise the maintainers have to sift. A change in an
 area a maintainer has said they are working on goes to a branch and a pull request carrying those answers, never
 straight to `main`, whatever standing permission to push `main` exists. An optional path another component may offer
