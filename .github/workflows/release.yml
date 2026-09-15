@@ -1,10 +1,10 @@
 name: Release
 
 # A tag push releases that tag, which is the version the wheels carry: a
-# pre-release such as 2.1.0rc1 is released as one while a release holds the
-# "Latest" badge, and as the latest release while a pre-release does, so a
-# release candidate follows the one before it. A manual run releases the tag it
-# names and can hold the release off the badge, for a fix to an older series.
+# pre-release such as 2.1.0rc1 is released as one. A manual run releases the tag
+# it names and decides the "Latest" badge: held off a fix to an older series, or
+# given to a pre-release, which is then released as a release since GitHub gives
+# the badge to no pre-release.
 
 on:
   push:
@@ -17,9 +17,13 @@ on:
         type: string
         required: true
       latest:
-        description: Designate this release as the latest when a release of its kind is; off holds the badge back
-        type: boolean
-        default: true
+        description: Designate this release as the latest; auto does so for a release and not for a pre-release
+        type: choice
+        options:
+          - auto
+          - always
+          - never
+        default: auto
 
 permissions:
   contents: read
@@ -149,17 +153,17 @@ jobs:
       - name: Classify the tag
         id: kind
         env:
-          GH_TOKEN: ${{ github.token }}
           LATEST: ${{ inputs.latest }}
         run: |
-          # A release takes the "Latest release" badge, and a pre-release while
-          # the release holding it is one too, unless a manual run holds it
-          # back; GitHub gives the badge to no pre-release, so one that takes
-          # it is marked as a release
+          # A release takes the "Latest release" badge and a pre-release does
+          # not, unless a manual run says otherwise; GitHub gives the badge to
+          # no pre-release, so one designated takes it marked as a release
           is_prerelease() { echo "$1" | grep -qE '((a|b|rc)|\.dev)[0-9]+$'; }
-          holder="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
-          latest=true
-          if [ "${LATEST}" = "false" ] || { is_prerelease "${RELEASE_TAG}" && ! is_prerelease "${holder}"; }; then latest=false; fi
+          case "${LATEST:-auto}" in
+            always) latest=true ;;
+            never) latest=false ;;
+            *) if is_prerelease "${RELEASE_TAG}"; then latest=false; else latest=true; fi ;;
+          esac
           prerelease=false
           if [ "${latest}" = false ] && is_prerelease "${RELEASE_TAG}"; then prerelease=true; fi
           {
