@@ -49,7 +49,8 @@ rig); can the change affect behavior it was not aimed at, and what was run to kn
 makes it work, since every line the first two answers do not need is noise the maintainers have to sift. A change in an
 area a maintainer has said they are working on goes to a branch and a pull request carrying those answers, never
 straight to `main`, whatever standing permission to push `main` exists. An issue is closed by a maintainer,
-never by the change that claims to fix it. An optional path another component may offer
+never by you. A pull request's `Closes` keyword is not you closing it; the maintainer's merge is.
+An optional path another component may offer
 (a protocol a compositor advertises, a driver feature, a device) is taken only when its presence is detected and never
 as the default: that it is exposed is not proof it works, and a reviewer has to be able to tell what runs where.
 
