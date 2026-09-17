@@ -27,6 +27,10 @@ setup(
             features=["extension-module"],
             debug=False,
             strip=Strip.All,
+            # `--locked`: a wheel carries the crate versions Cargo.lock names, and a
+            # manifest that has outrun the lock fails the build rather than silently
+            # resolving past it.
+            args=["--locked"],
         )
     ],
     classifiers=[
