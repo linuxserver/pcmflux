@@ -24,7 +24,7 @@ jobs:
         # deny.toml allows permissive licenses only; the native libpulse
         # (LGPL-2.1-or-later) and libopus (BSD-3-Clause) are documented in
         # LICENSES.md.
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: pcmflux/Cargo.toml
           arguments: --exclude-dev

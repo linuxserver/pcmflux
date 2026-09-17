@@ -109,7 +109,7 @@ jobs:
           grep -q "version=\"${RELEASE_TAG}\"," setup.py
 
       - name: Build wheels (${{ matrix.platform }}_${{ matrix.target.arch }})
-        uses: pypa/cibuildwheel@v4.2.1
+        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
         env:
           # Every interpreter cibuildwheel offers, floored by python_requires.
           CIBW_BUILD: "*-${{ matrix.platform }}_${{ matrix.target.arch }}"
@@ -172,7 +172,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
