@@ -32,7 +32,10 @@ across different modes over keeping duplicate code for no reason and more fragil
 you are confident there will be no regressions (or able to validate regressions). Screen coroutine usage in both
 Python and JavaScript, as well as thread usage in all languages, so that everything is performant and does not lead to
 hanging or lagging. Performance preservation or improvements such as zero-copy and latency-reducing measures are
-always important. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher.
+always important, and the GIL is held no longer than the work needs. End-to-end latency and an unrestricted frame
+rate are separate goals rather than two ends of one dial: neither is spent to buy the other. A change never drops a
+capability or falls back to an older implementation to make itself simpler; where one seems to be in the way, say
+what it is rather than removing it. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher.
 A defect that predates the change you are making is still in scope: finding it does not make it someone else's,
 and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is broken, what you ruled out, and
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
@@ -45,7 +48,8 @@ the path a user takes rather than a switch a user would never flip (a developer 
 rig); can the change affect behavior it was not aimed at, and what was run to know; and is the change stripped to what
 makes it work, since every line the first two answers do not need is noise the maintainers have to sift. A change in an
 area a maintainer has said they are working on goes to a branch and a pull request carrying those answers, never
-straight to `main`, whatever standing permission to push `main` exists. An optional path another component may offer
+straight to `main`, whatever standing permission to push `main` exists. An issue is closed by a maintainer,
+never by the change that claims to fix it. An optional path another component may offer
 (a protocol a compositor advertises, a driver feature, a device) is taken only when its presence is detected and never
 as the default: that it is exposed is not proof it works, and a reviewer has to be able to tell what runs where.
 
