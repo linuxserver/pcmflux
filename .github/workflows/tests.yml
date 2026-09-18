@@ -1,0 +1,48 @@
+name: Tests
+
+# The crate's own tests, on both architectures the wheels ship for. Nothing else
+# in CI compiles the tree -- CodeQL extracts without a build and the license gate
+# resolves the crate graph only -- so this is where a build error surfaces.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo:
+    name: cargo test (${{ matrix.target.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Native libraries
+        # libopus is vendored and built by its crate, so cmake and a C compiler
+        # are needed whatever the platform; PulseAudio is the capture binding.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential libpulse-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        # No sound server runs on a runner; the tests that need one are ignored.
+        run: cargo test --manifest-path pcmflux/Cargo.toml
