@@ -18,7 +18,9 @@ and every change is validated before it is reported. `cargo test --lib` is the f
 `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement to quote rather
 than assert. The test binary links the interpreter because pyo3's `extension-module` is a crate feature the Python
 build alone asks for (`features` on the `RustExtension` in `setup.py`); putting it back on the pyo3 dependency itself
-would leave `cargo test` unable to link. End to end, a change is a wheel (`pip wheel . --no-deps`) installed into a
+would leave `cargo test` unable to link. The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver
+pre-release the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the
+manifest and the lock, so a build ahead of a release carries the series version and a release the tag's. End to end, a change is a wheel (`pip wheel . --no-deps`) installed into a
 selkies sandbox as the Agentic Development section of that repository's `docs/development.md` describes, driven by its audio suites over
 both transports with the installed Firefox and Chrome and Playwright/Selenium/Puppeteer/Cypress WebKit in place of
 Safari. Ask before building an environment on a machine that was not set up for one (Miniforge serves a host with a
