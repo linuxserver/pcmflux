@@ -82,7 +82,7 @@ async def send_audio_chunks(websocket, queue):
             queue.task_done()
 
 async def status_logger():
-    """Periodically logs the capture state, queue depth and dropped-frame count
+    """Periodically logs the capture state, queue depth, and dropped-frame count
     so backpressure drops are visible rather than silent.
 
     `start_capture` returns while the native thread may still be retrying the

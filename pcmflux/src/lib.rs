@@ -351,12 +351,12 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
     check_opus_sample_rate(parsed.sample_rate)?;
     if !valid_opus_duration(parsed.frame_duration_ms) {
         return value_error(format!(
-            "frame_duration_ms must be one of 2.5, 5, 10, 20, 40 or 60 (got {})",
+            "frame_duration_ms must be one of 2.5, 5, 10, 20, 40, or 60 (got {})",
             parsed.frame_duration_ms
         ));
     }
     if !matches!(parsed.channels, 1 | 2 | 6 | 8) {
-        return value_error(format!("channels must be 1, 2, 6 or 8 (got {})", parsed.channels));
+        return value_error(format!("channels must be 1, 2, 6, or 8 (got {})", parsed.channels));
     }
     if parsed.latency_ms < 0 {
         return value_error(format!(
@@ -372,14 +372,14 @@ fn value_error<T>(msg: String) -> PyResult<T> {
     Err(pyo3::exceptions::PyValueError::new_err(msg))
 }
 
-/// Opus codecs only run at 8, 12, 16, 24 or 48 kHz; anything else would fail encoder or
+/// Opus codecs only run at 8, 12, 16, 24, or 48 kHz; anything else would fail encoder or
 /// decoder creation on the worker, so it is rejected up front.
 fn check_opus_sample_rate(rate: u32) -> PyResult<()> {
     if matches!(rate, 8000 | 12000 | 16000 | 24000 | 48000) {
         Ok(())
     } else {
         value_error(format!(
-            "sample_rate must be 8000, 12000, 16000, 24000 or 48000 (got {rate})"
+            "sample_rate must be 8000, 12000, 16000, 24000, or 48000 (got {rate})"
         ))
     }
 }
@@ -1951,7 +1951,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
     inner.emit_audio_header.store(!settings.omit_audio_header, Ordering::Relaxed);
 
-    // Sample rate, channel count and frame duration were validated by `extract_settings`.
+    // Sample rate, channel count, and frame duration were validated by `extract_settings`.
     let spec = Spec {
         format: Format::S16le,
         rate: settings.sample_rate,
@@ -2637,7 +2637,7 @@ impl AudioCapture {
         self.inner().running()
     }
 
-    /// Lifecycle phase: `"idle"`, `"starting"`, `"running"` or `"failed"`. A run that
+    /// Lifecycle phase: `"idle"`, `"starting"`, `"running"`, or `"failed"`. A run that
     /// fails after `start_capture` returned (its retry ladder gave up, or a mid-run
     /// reconnect budget was spent) reads `"failed"` with the reason in `last_error`.
     #[getter]
@@ -2876,7 +2876,7 @@ impl AudioPlayback {
         self.inner().running()
     }
 
-    /// Lifecycle phase: `"idle"`, `"starting"`, `"running"` or `"failed"`, the playback
+    /// Lifecycle phase: `"idle"`, `"starting"`, `"running"`, or `"failed"`, the playback
     /// mirror of `AudioCapture.state`.
     #[getter]
     fn state(&self) -> &'static str {

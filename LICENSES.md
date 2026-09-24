@@ -27,9 +27,9 @@ and in the crates' build scripts.
 ## Rust crates
 
 Resolved with `cargo metadata` (normal dependencies only): 20 crates, every one
-permissive (MPL-2.0 for `pcmflux` itself); no crate is GPL, LGPL, AGPL or
+permissive (MPL-2.0 for `pcmflux` itself); no crate is GPL, LGPL, AGPL, or
 unlicensed. Build-only dependencies (`cmake`, `pkg-config`, `cc`,
-`pyo3-build-config` and their dependencies) are MIT/Apache-2.0 as well and are
+`pyo3-build-config`, and their dependencies) are MIT/Apache-2.0 as well and are
 covered by cargo-deny.
 
 | Crate | Version | License (SPDX) | Category | Native library / note |
@@ -79,7 +79,7 @@ covered by cargo-deny.
 
 `pcmflux/deny.toml` is the [cargo-deny](https://embarkstudios.github.io/cargo-deny/)
 policy: the allow list is permissive-only (MIT, Apache-2.0, Apache-2.0 WITH
-LLVM-exception, ISC, Zlib, Unicode-3.0, MPL-2.0), so a GPL, LGPL or unlicensed
+LLVM-exception, ISC, Zlib, Unicode-3.0, MPL-2.0), so a GPL, LGPL, or unlicensed
 crate fails `cargo deny --exclude-dev check licenses bans sources` (run from
 `pcmflux/`), which `.github/workflows/licenses.yml` runs on every push and pull
 request. The native libraries above are outside what crate metadata describes:

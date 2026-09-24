@@ -125,7 +125,7 @@ ffmpeg -i unix:/run/user/1000/audio.sock -c:a copy capture.opus
 
 ## Development
 
-`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. `cargo test --lib` covers the capture, encode and assembly paths, and `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement. `pip wheel . --no-deps` builds the extension the way the released wheels are built, and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end audio suites.
+`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. `cargo test --lib` covers the capture, encode, and assembly paths, and `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement. `pip wheel . --no-deps` builds the extension the way the released wheels are built, and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end audio suites.
 
 ## License
 
