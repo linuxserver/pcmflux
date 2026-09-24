@@ -8,13 +8,23 @@ pcmflux is a high-performance audio capture and encoding module for Python.
 
 It is designed to capture system audio using PulseAudio, encode it into the Opus format, and stream it with low latency. A key optimization is its ability to detect and discard silent audio chunks, significantly reducing network traffic and CPU usage during periods of no sound.
 
-## Prerequisites
+## Installation
 
-This package builds a native Rust extension (via `setuptools-rust`/PyO3). It requires a Rust toolchain (`cargo`/`rustc` 1.88 or newer) plus the development headers for PulseAudio and Opus on your system.
+Every release on the [GitHub Releases page](https://github.com/selkies-project/pcmflux/releases) carries wheels (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9 and newer), the pre-releases cut per commit included; take the one for your interpreter and platform:
+```bash
+pip install ./pcmflux-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
+```
 
-On Debian/Ubuntu, you can install them with:
+A wheel carries the PulseAudio client library it links, so all a host needs is a PulseAudio server, or PipeWire through `pipewire-pulse`, to capture from and play into.
+
+### Building from source
+
+This package builds a native Rust extension (via `setuptools-rust`/PyO3). It requires a Rust toolchain (`cargo`/`rustc` 1.88 or newer) plus the PulseAudio development headers on your system.
+
+On Debian/Ubuntu, from the root of the repository:
 ```bash
 sudo apt-get install libpulse-dev cmake build-essential
+pip install .
 ```
 
 The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and is linked statically, so `cmake` and a C compiler are always required and no system `libopus` is used.
@@ -26,7 +36,7 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 - **Silence Detection:** Intelligently skips encoding and sending silent audio chunks.
 - **Native Audio Header:** With `omit_audio_header=False` (the default), the encoder prepends a 2-byte `[0x01, 0x00]` header to each chunk natively, so WebSocket transports avoid an extra Python copy. Set it to `True` for raw Opus (WebRTC/RTP).
 - **Optional RED redundancy (RFC 2198):** `red_distance` (0–4, default 0) prepends redundant copies of recent Opus payloads for lossy/unreliable transports; `0` disables it (the default for reliable WebSocket/TCP).
-- **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9–3.14)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
+- **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9 and newer)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
 - **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
 - **Multichannel Opus:** Mono, stereo, and 5.1 / 7.1 surround (via the Opus multistream API with Chromium-compatible channel layouts); `channels` accepts 1, 2, 6, or 8.
 - **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo, and `write` / `write_red` take any bytes-like object (`bytes`, `memoryview`, `bytearray`, ...).
