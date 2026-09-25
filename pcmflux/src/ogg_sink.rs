@@ -111,12 +111,25 @@ fn header_pages(serial: u32, head: &OpusHead) -> Vec<u8> {
 
 impl OggSink {
     /// Bind the socket at `path`, or None when no path is configured or the bind fails:
-    /// the sink is optional and never takes the capture down.
+    /// the sink is optional and never takes the capture down. A file there that another
+    /// account owns is left alone and reported: in a shared directory it is that account's
+    /// listener, and a reader of this stream would reach it.
     pub fn try_bind(path: &str, head: &OpusHead) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
         if path.is_empty() {
             return None;
         }
-        let _ = fs::remove_file(path);
+        let stale = match fs::symlink_metadata(path) {
+            Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
+                Err(format!("it belongs to uid {}, not this session", meta.uid()))
+            }
+            Ok(_) => fs::remove_file(path).map_err(|e| e.to_string()),
+            Err(_) => Ok(()),
+        };
+        if let Err(e) = stale {
+            eprintln!("[pcmflux] ogg sink not bound on {path}: {e}");
+            return None;
+        }
         let listener = match UnixListener::bind(path).and_then(|l| l.set_nonblocking(true).map(|_| l)) {
             Ok(l) => l,
             Err(e) => {
@@ -197,6 +210,17 @@ mod tests {
 
     /// A consumer that connects reads the two header pages and then every packet page,
     /// each with a checksum the Ogg polynomial reproduces and the granule it was given.
+    #[test]
+    fn a_stale_socket_of_this_session_is_replaced() {
+        let path = format!("/tmp/pcmflux-ogg-stale-{}.sock", std::process::id());
+        fs::write(&path, b"stale").unwrap();
+        let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
+        let sink = OggSink::try_bind(&path, &head);
+        assert!(sink.is_some(), "an own leftover is removed and the socket bound");
+        drop(sink);
+        assert!(fs::symlink_metadata(&path).is_err(), "the socket is removed with the sink");
+    }
+
     #[test]
     fn stream_pages_are_well_formed() {
         let path = format!("/tmp/pcmflux-ogg-test-{}.sock", std::process::id());
