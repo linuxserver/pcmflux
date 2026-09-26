@@ -121,7 +121,7 @@ impl OggSink {
         }
         let stale = match fs::symlink_metadata(path) {
             Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
-                Err(format!("it belongs to uid {}, not this session", meta.uid()))
+                Err("another account owns it".to_string())
             }
             Ok(_) => fs::remove_file(path).map_err(|e| e.to_string()),
             Err(_) => Ok(()),
